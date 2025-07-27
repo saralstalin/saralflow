@@ -1,0 +1,23 @@
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden; /* Hide scrollbars if content overflows */
+    background-color: var(--vscode-editor-background); /* Use VS Code theme background */
+    color: var(--vscode-editor-foreground); /* Use VS Code theme foreground */
+    font-family: var(--vscode-font-family); /* Use VS Code theme font */
+}
+
+h1 {
+    text-align: center;
+    padding: 10px;
+    margin: 0;
+    color: var(--vscode-editor-foreground);
+}
+
+#mynetwork {
+    width: 100%;
+    height: calc(100vh - 60px); /* Adjust height, assuming h1 takes ~60px */
+    border: 1px solid var(--vscode-editorGroup-border); /* Add a border for visual clarity */
+    background-color: var(--vscode-editor-background);
+}
