@@ -1,71 +1,28 @@
-# SaralCode README
+# SaralFlow - Code Semantic Graph Extension
 
-This is the README for your extension "SaralCode". After writing up a brief description, we recommend including the following sections.
+This VS Code extension aims to help in the "story to code" generation process by building a comprehensive semantic graph of your codebase.
 
 ## Features
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+-   **Project-Wide Graph Construction:** Scans all relevant code files (e.g., C#, TypeScript, Python) in your workspace to identify classes, methods, properties, and files.
+-   **Containment Relationships:** Maps hierarchical relationships (e.g., files contain classes, classes contain methods).
+-   **Interdependency Mapping:** (Future/Targeted) Aims to identify references between symbols and inheritance relationships between types.
+-   **LLM Context Provider:** The core purpose is to use this graph to provide highly relevant and structured code context to Large Language Models (LLMs) to facilitate accurate code generation and modifications based on natural language stories.
 
-For example if there is an image subfolder under your extension project workspace:
+## Usage
 
-\!\[feature X\]\(images/feature-x.png\)
+1.  Open a workspace/folder containing your code.
+2.  Open the VS Code Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P`).
+3.  Type `SaralFlow: Show Code Semantic Graph` and press Enter.
+4.  The extension will analyze your codebase and display a visual representation of the semantic graph in a new webview panel.
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+## Development
 
-## Requirements
-
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
-
-## Extension Settings
-
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
-
-For example:
-
-This extension contributes the following settings:
-
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+This extension is built using TypeScript and the VS Code Extension API.
 
 ## Known Issues
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
-
-## Release Notes
-
-Users appreciate release notes as you update your extension.
-
-### 1.0.0
-
-Initial release of ...
-
-### 1.0.1
-
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
+-   References and inheritance relationships may not be fully resolved due to limitations or timing issues with language server programmatic access in the extension development host. We are actively investigating robust solutions for this.
 
 ---
-
-## Following extension guidelines
-
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
-
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+**SaralFlow** - *Auto generate code changes from story description*
