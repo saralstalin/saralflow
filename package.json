@@ -26,17 +26,29 @@
       {
         "command": "SaralFlow.openSqlGenerator",
         "title": "SaralFlow: Open SQL Generator"
+      },
+      {
+        "command": "SaralFlow.queryGraphForLLM",
+        "title": "SaralFlow: Query Graph for LLM Context"
+      },
+      {
+        "command": "SaralFlow.proposeCodeFromStory",
+        "title": "SaralFlow: Propose Code From Story"
+      },
+      {
+        "command": "SaralFlow.openGenerator",
+        "title": "SaralFlow: Open Code Generator"
       }
     ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile", 
+    "vscode:prepublish": "npm run compile",
     "compile": "npm run check-types && npm run lint && node esbuild.js && npm run copy-webview",
     "watch": "npm-run-all -p watch:*",
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
     "package": "npm run check-types && npm run lint && node esbuild.js --production && npm run copy-webview",
-    "copy-webview": "cpx \"./webview/**/*\" ./dist/webview", 
+    "copy-webview": "cpx \"./webview/**/*\" ./dist/webview",
     "compile-tests": "tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
@@ -45,8 +57,10 @@
     "test": "vscode-test"
   },
   "devDependencies": {
+    "@types/diff-match-patch": "^1.0.36",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
+    "@types/node-fetch": "^2.6.12",
     "@types/vscode": "^1.102.0",
     "@typescript-eslint/eslint-plugin": "^8.31.1",
     "@typescript-eslint/parser": "^8.31.1",
@@ -58,5 +72,11 @@
     "npm-run-all": "^4.1.5",
     "typescript": "^5.8.3",
     "vsce": "^2.11.0"
+  },
+  "dependencies": {
+    "diff-match-patch": "^1.0.5",
+    "marked": "^16.1.1",
+    "node-fetch": "^2.7.0",
+    "openai": "^5.10.2"
   }
 }

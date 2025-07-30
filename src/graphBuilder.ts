@@ -1,20 +1,32 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import {CodeGraph, INode, IEdge, EdgeType, toNodeKind, generateNodeId, GraphNode } from './graphTypes';
+import {CodeGraph, INode, IEdge, EdgeType, toNodeKind, generateNodeId, GraphNode, ISemanticGraph  } from './graphTypes';
+import { getEmbedding } from './embeddingService';
+import { getApiKey } from './extension';
 
-/**
- * Extracts semantic information from the workspace and constructs a graph.
- * This version includes:
- * - File discovery across the workspace.
- * - Document symbol extraction for containment relationships.
- * - Robust C# extension activation.
- * - Building interdependencies (REFERENCES via LSP with fallback, INHERITS via LSP with C# regex fallback).
- */
-export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: IEdge[] }> {
+export async function extractSemanticGraph(): Promise<ISemanticGraph> {
     const nodes: INode[] = [];
     const edges: IEdge[] = [];
     const nodeMap = new Map<string, INode>(); // Map<NodeId, INode> for quick lookup
     const processedFiles = new Set<string>(); // Set<Filepath> to track files already processed
+
+    // --- API Key and Embedding setup ---
+    let apiKey: string | undefined;
+    try {
+        // Assuming getApiKey fetches the API key from secretStorage
+        apiKey = await getApiKey(); // Ensure getApiKey is defined and accessible
+    } catch (e) {
+        console.error(`[SaralFlow Graph] Failed to retrieve API Key: ${e}`);
+        apiKey = undefined;
+    }
+    const useEmbeddings = !!apiKey;
+
+    if (!useEmbeddings) {
+        vscode.window.showWarningMessage('SaralFlow Graph: API Key not set. Node embeddings will not be generated. Semantic similarity search will be limited or unavailable.');
+        console.warn('[SaralFlow Graph] API Key not available. Embeddings will not be generated.');
+    } else {
+        console.log('[SaralFlow Graph] API Key available. Embeddings will be generated.');
+    }
 
     if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
         vscode.window.showInformationMessage('No workspace folder open. Cannot build graph.');
@@ -33,9 +45,11 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
         if (!symbolsInFile) {
             return null;
         }
+        // Sort by start position for reliable containment checks if not already sorted
+        // (Though your processing loop already ensures this for adding to fileSymbolsMap)
         for (let i = symbolsInFile.length - 1; i >= 0; i--) {
             const symbol = symbolsInFile[i];
-            if (!symbol.range) {continue;}
+            if (!symbol.range) { continue; }
             const start = new vscode.Position(symbol.range.start.line, symbol.range.start.character);
             const end = new vscode.Position(symbol.range.end.line, symbol.range.end.character);
             const symbolRange = new vscode.Range(start, end);
@@ -74,7 +88,6 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
     }
 
     // Give the language server a substantial amount of time to load the project's semantic model.
-    // This is a heuristic, but often necessary for complex language servers in the Extension Host.
     const initialLSPWaitTimeMs = 15000; // 15 seconds
     console.log(`[SaralFlow Graph] Waiting ${initialLSPWaitTimeMs / 1000} seconds for C# language server to initialize...`);
     await new Promise(resolve => setTimeout(resolve, initialLSPWaitTimeMs));
@@ -111,8 +124,10 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
                 id: fileNodeId,
                 label: relativePath,
                 kind: 'File',
+                detail: '', // Files don't have LSP detail in this context
                 uri: fileNodeId,
-                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }
+                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, // Placeholder range for file
+                codeSnippet: await vscode.workspace.openTextDocument(fileUri).then(doc => doc.getText()) // Get full file content for file node
             };
             nodes.push(fileNode);
             nodeMap.set(fileNodeId, fileNode);
@@ -135,16 +150,19 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
                     const symbolId = `${parentId}#${symbolUniqueQualifier}`;
 
                     if (!nodeMap.has(symbolId)) {
+                        const codeSnippet = document.getText(symbol.range); // Extract the actual code snippet
                         const symbolNode: INode = {
                             id: symbolId,
                             label: symbol.name,
                             kind: vscode.SymbolKind[symbol.kind],
+                            detail: symbol.detail || '', // Keep LSP detail (can be empty)
                             uri: fileUri.toString(),
                             range: {
                                 start: { line: symbol.range.start.line, character: symbol.range.start.character },
                                 end: { line: symbol.range.end.line, character: symbol.range.end.character }
                             },
-                            parentIds: [parentId]
+                            parentIds: [parentId],
+                            codeSnippet: codeSnippet // Store the code snippet
                         };
                         nodes.push(symbolNode);
                         nodeMap.set(symbolId, symbolNode);
@@ -155,6 +173,7 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
                             label: 'CONTAINS'
                         });
 
+                        // Add to fileSymbolsMap only if it's not a 'File' node itself
                         if (symbolNode.kind !== 'File' && symbolNode.range) {
                             let symbolsInFile = fileSymbolsMap.get(fileUri.toString());
                             if (!symbolsInFile) {
@@ -188,12 +207,50 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
     console.log('[SaralFlow Graph] Sorting symbols for quick lookup...');
     fileSymbolsMap.forEach(symbols => {
         symbols.sort((a, b) => {
-            if (!a.range || !b.range) {return 0;}
+            if (!a.range || !b.range) { return 0; }
             return a.range.start.line - b.range.start.line || a.range.start.character - b.range.start.character;
         });
     });
     console.log('[SaralFlow Graph] Finished sorting symbols.');
     console.log(`[SaralFlow Graph] DEBUG: After initial file and symbol processing: nodes.length = ${nodes.length}, edges.length = ${edges.length}`);
+
+
+    // --- NEW: Generate and store embeddings for all nodes ---
+    console.log(`[SaralFlow Graph] Generating embeddings for ${nodes.length} nodes...`);
+    vscode.window.showInformationMessage(`SaralFlow Graph: Generating embeddings for ${nodes.length} nodes (this may take a while)...`);
+
+    let embeddedNodesCount = 0;
+    for (const node of nodes) {
+        if (useEmbeddings && node.codeSnippet) { // Only embed if API key is present AND we have a code snippet
+            try {
+                // Combine relevant text for embedding: label, kind, and the actual code snippet
+                // You can adjust this combination based on what you want to emphasize in embeddings
+                const textToEmbed = `${node.kind}: ${node.label}\n${node.detail || ''}\n${node.codeSnippet}`;
+
+                // Optional: Trim long snippets to avoid hitting token limits for embedding models
+                // OpenAI's text-embedding-3-small supports 8191 tokens
+                const maxEmbedTextLength = 8000; // Example, adjust based on model limits
+                const truncatedText = textToEmbed.length > maxEmbedTextLength ?
+                    textToEmbed.substring(0, maxEmbedTextLength) : textToEmbed;
+
+                const embedding = await getEmbedding(truncatedText, apiKey!);
+                if (embedding) {
+                    node.embedding = embedding;
+                    embeddedNodesCount++;
+                } else {
+                    console.warn(`[SaralFlow Graph] Failed to generate embedding for node: ${node.label} (${node.kind}). No embedding returned.`);
+                }
+            } catch (embedError: any) {
+                console.error(`[SaralFlow Graph] Error embedding node ${node.label} (${node.kind}) from ${node.uri} at range ${node.range ? `${node.range.start.line}:${node.range.start.character}` : 'N/A'}: ${embedError.message}`);
+            }
+        } else if (useEmbeddings && !node.codeSnippet) {
+            console.warn(`[SaralFlow Graph] Skipping embedding for node ${node.label} (no code snippet available or file node).`);
+        } else if (!useEmbeddings) {
+            // Already warned at the start if API key is missing
+        }
+    }
+    console.log(`[SaralFlow Graph] Finished generating node embeddings. Successfully embedded ${embeddedNodesCount} nodes.`);
+    vscode.window.showInformationMessage(`SaralFlow Graph: Generated embeddings for ${embeddedNodesCount} nodes.`);
 
 
     // --- 3. Build Interdependencies: REFERENCES (LSP with Fallback) ---
@@ -258,7 +315,7 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
                             }
                         }
                     } else {
-                         console.log(`[SaralFlow Graph] DEBUG: Ref to ${symbolNode.label} from ${refFileUriStr} not added (fromNodeId is self or not in nodeMap: ${fromNodeId})`);
+                        console.log(`[SaralFlow Graph] DEBUG: Ref to ${symbolNode.label} from ${refFileUriStr} not added (fromNodeId is self or not in nodeMap: ${fromNodeId})`);
                     }
                 });
             } else if (references === null || references === undefined || references.length === 0) {
@@ -275,9 +332,9 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
 
                 for (const fileToCheckUri of files) {
                     const fileToCheckPath = fileToCheckUri.fsPath;
-                    if (fileToCheckPath === symbolNode.uri) continue; // Don't check the file defining the symbol
+                    if (fileToCheckPath === symbolNode.uri) {continue;} // Don't check the file defining the symbol
 
-                    if (!processedFiles.has(fileToCheckPath)) continue; // Only check files we actually processed
+                    if (!processedFiles.has(fileToCheckPath)) {continue;} // Only check files we actually processed
 
                     const documentToCheck = await vscode.workspace.openTextDocument(fileToCheckUri);
                     const fileContent = documentToCheck.getText();
@@ -328,9 +385,8 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
 
     for (const [symbolNodeId, symbolNode] of nodeMap.entries()) {
         if ((symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Class] ||
-             symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Interface]) &&
-            symbolNode.uri && symbolNode.range)
-        {
+            symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Interface]) &&
+            symbolNode.uri && symbolNode.range) {
             const classUri = vscode.Uri.parse(symbolNode.uri);
             const classPosition = new vscode.Position(symbolNode.range.start.line, symbolNode.range.start.character);
 
@@ -383,7 +439,7 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
                             }
                         });
                     } else if (supertypes === null || supertypes === undefined || supertypes.length === 0) {
-                         console.log(`[SaralFlow Graph] DEBUG: LSP executeTypeHierarchySupertypes returned empty/null/undefined for "${symbolNode.label}".`);
+                        console.log(`[SaralFlow Graph] DEBUG: LSP executeTypeHierarchySupertypes returned empty/null/undefined for "${symbolNode.label}".`);
                     }
                 } else if (typeHierarchyItems === null || typeHierarchyItems === undefined || typeHierarchyItems.length === 0) {
                     console.log(`[SaralFlow Graph] DEBUG: LSP prepareTypeHierarchy returned empty/null/undefined for "${symbolNode.label}".`);
@@ -480,14 +536,14 @@ export async function extractSemanticGraph(): Promise<{ nodes: INode[]; edges: I
                                         label: 'CALLS'
                                     });
                                     callEdgesCount++;
-                                    console.log(`[SaralFlow Graph] DEBUG: Added CALLS edge (LSP) from ${symbolNode.label} to ${nodeMap.get(calleeSymbolId)?.label}`);
+                                    console.log(`[SaralFlow Graph] DEBUG: Added CALLS edge (LSP) from ${nodeMap.get(calleeSymbolId)?.label} to ${symbolNode.label}`);
                                 }
                             } else {
                                 console.log(`[SaralFlow Graph] DEBUG: LSP Callee node for "${symbolNode.label}" not found/self: ${calleeSymbolId}`);
                             }
                         });
                     } else if (outgoingCalls === null || outgoingCalls === undefined || outgoingCalls.length === 0) {
-                         console.log(`[SaralFlow Graph] DEBUG: LSP executeCallHierarchyOutgoingCalls returned empty/null/undefined for "${symbolNode.label}".`);
+                        console.log(`[SaralFlow Graph] DEBUG: LSP executeCallHierarchyOutgoingCalls returned empty/null/undefined for "${symbolNode.label}".`);
                     }
                 } else if (callHierarchyItems === null || callHierarchyItems === undefined || callHierarchyItems.length === 0) {
                     console.log(`[SaralFlow Graph] DEBUG: LSP prepareCallHierarchy returned empty/null/undefined for "${symbolNode.label}".`);

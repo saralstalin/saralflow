@@ -1,14 +1,29 @@
 // src/extension.ts
 import * as vscode from 'vscode';
 import * as path from 'path'; // Import the 'path' module
-import { CodeGraph, GraphNode, GraphEdge, INode, IEdge, NodeKind, EdgeType, generateNodeId, toNodeKind } from './graphTypes'; // Import our new types
+import { CodeGraph, GraphNode, GraphEdge, INode, IEdge, NodeKind, EdgeType, generateNodeId, toNodeKind } from './graphTypes'; 
+import { getEmbedding, cosineSimilarity } from'./embeddingService';
+import fetch from 'node-fetch';
+import DiffMatchPatch from 'diff-match-patch';
+
+// Keep track of the last parsed changes to apply them
+let lastProposedChanges: ProposedFileChange[] = [];
 
 import {extractSemanticGraph, processDocumentSymbols, fetchAndProcessCallHierarchy} from './graphBuilder';
 
 let currentGraph: CodeGraph = new CodeGraph(); // Our in-memory graph instance
 // Declare panel globally so it can be reused or disposed
 let graphPanel: vscode.WebviewPanel | undefined = undefined;
-let sqlcodePanel: vscode.WebviewPanel | undefined = undefined;
+
+let codeViewPanel: vscode.WebviewPanel | undefined = undefined;
+
+let extensionContext: vscode.ExtensionContext;
+
+// Define the structure for the embedding API response
+interface EmbeddingResponse {
+    data: { embedding: number[] }[];
+    // Other fields might be present depending on the API
+}
 
 // Global variable to store the built graph
 let semanticGraph: { nodes: INode[]; edges: IEdge[] } = { nodes: [], edges: [] };
@@ -21,6 +36,12 @@ const OPENAI_CHAT_API_KEY = 'sk-proj-5wx2-CdZIOACOAovIyHencvfPRlYjTR6QJHQEDO1ONh
 // IMPORTANT: Replace with your actual OpenAI API key for embeddings (can be the same as chat)
 const OPENAI_EMBEDDING_API_KEY = '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';
 
+// Function to retrieve the API Key
+export function getApiKey(): string {
+  const apiKey = OPENAI_EMBEDDING_API_KEY;
+  return apiKey;
+}
+
 // Global variable to store the embedded schema chunks for the current workspace
 // This will act as our in-memory vector store.
 let cachedSchemaChunks: { text: string, embedding: number[] }[] = [];
@@ -31,6 +52,7 @@ let sqlFilesBaseUri: vscode.Uri | undefined;
 
 
 export function activate(context: vscode.ExtensionContext) {
+    extensionContext = context;
 
     console.log('Congratulations, your extension "SaralFlow" is now active!');
 
@@ -78,7 +100,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 
     // *** Initial Graph Building on Activation ***
-    const buildGraphDisposable = vscode.commands.registerCommand('SaralFlow.buildGraphOnStartup', async () => {
+    let buildGraphDisposable = vscode.commands.registerCommand('SaralFlow.buildGraphOnStartup', async () => {
         if (isGraphBuilding) {
             vscode.window.showInformationMessage('SaralFlow: Graph build already in progress.');
             return;
@@ -210,15 +232,11 @@ export function activate(context: vscode.ExtensionContext) {
             context.subscriptions
         );
 
-        
-
         // Reset when the current panel is closed
         graphPanel.onDidDispose(() => {
             graphPanel = undefined;
         }, null, context.subscriptions);
       
-
-       
     });
     context.subscriptions.push(showGraphCommand);
 
@@ -248,7 +266,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         vscode.window.showInformationMessage(`SaralFlow: Querying graph for "${query}"...`);
-        const relevantNodes = await querySemanticGraph(query);
+        const relevantNodes = await querySemanticGraph(query, 2, 0.7);
 
         if (relevantNodes.length === 0) {
             vscode.window.showInformationMessage(`SaralFlow: No relevant code elements found for "${query}".`);
@@ -443,6 +461,28 @@ export function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(disposableSqlGenerator);
 
+    context.subscriptions.push(vscode.commands.registerCommand('SaralFlow.proposeCodeFromStory', async () => {
+        if (!semanticGraph || semanticGraph.nodes.length === 0) {
+            vscode.window.showWarningMessage('SaralFlow: Graph not built or is empty. Please build the graph first.');
+            return;
+        }
+
+        const userStory = await vscode.window.showInputBox({
+            prompt: 'Describe the feature or change you want to implement (User Story)',
+            placeHolder: 'e.g., "As a user, I want to add a new API endpoint that lists all products with a special tag."',
+            ignoreFocusOut: true,
+        });
+
+        if (!userStory) { return; }
+
+        await proposeCodeFromStory(userStory);
+    }));
+
+    // New Command to open the Webview
+    context.subscriptions.push(vscode.commands.registerCommand('SaralFlow.openGenerator', () => {
+        openSaralFlowWebview(context.extensionUri);
+    }));
+
     // Add a status bar item for quick access to the SQL Generator
     const sqlStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
     sqlStatusBarItem.text = `$(flame) SaralFlow`;
@@ -452,41 +492,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(sqlStatusBarItem);
 }
 
-/**
- * Generates an embedding for the given text using OpenAI's embedding API.
- * @param text The text to embed.
- * @param apiKey Your OpenAI API key.
- * @returns A promise that resolves to the embedding vector (number[]) or null if an error occurs.
- */
-async function getEmbedding(text: string, apiKey: string): Promise<number[] | null> {
-    try {
-        const response = await fetch('https://api.openai.com/v1/embeddings', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
-            },
-            body: JSON.stringify({
-                model: 'text-embedding-ada-002', // Recommended embedding model
-                input: text
-            })
-        });
 
-        if (!response.ok) {
-            const errorData: any = await response.json();
-            console.error('OpenAI Embedding API error:', errorData);
-            throw new Error(`Embedding API error: ${response.status} - ${errorData.error ? errorData.error.message : response.statusText}`);
-        }
-
-        const data: any = await response.json();
-        return data.data[0].embedding;
-    } catch (error: any) {
-        console.error('Error getting embedding:', error);
-        // Do not show error message here, as it might spam if many files fail.
-        // The calling function (loadSchemaContext) will handle overall errors.
-        return null;
-    }
-}
 
 /**
  * Loads the SQL project context by finding, chunking, and embedding .sql files.
@@ -583,37 +589,7 @@ async function loadSchemaContext() {
     }
 }
 
-/**
- * Calculates the cosine similarity between two vectors.
- * @param vec1 The first vector.
- * @param vec2 The second vector.
- * @returns The cosine similarity (a number between -1 and 1).
- */
-function cosineSimilarity(vec1: number[], vec2: number[]): number {
-    if (vec1.length !== vec2.length) {
-        console.error("Vectors must be of the same length for cosine similarity.");
-        return 0;
-    }
 
-    let dotProduct = 0;
-    let magnitude1 = 0;
-    let magnitude2 = 0;
-
-    for (let i = 0; i < vec1.length; i++) {
-        dotProduct += vec1[i] * vec2[i];
-        magnitude1 += vec1[i] * vec1[i];
-        magnitude2 += vec2[i] * vec2[i];
-    }
-
-    magnitude1 = Math.sqrt(magnitude1);
-    magnitude2 = Math.sqrt(magnitude2);
-
-    if (magnitude1 === 0 || magnitude2 === 0) {
-        return 0; // Avoid division by zero
-    }
-
-    return dotProduct / (magnitude1 * magnitude2);
-}
 
 /**
  * Applies the generated SQL code to the project files.
@@ -1027,26 +1003,106 @@ export function deactivate() {
     // (This is implicitly handled by context.subscriptions.push(sqlWatcher) in activate)
 }
 
-// NEW: Function to query the semantic graph based on a natural language query
-async function querySemanticGraph(queryText: string): Promise<INode[]> {
-    const relevantNodes: INode[] = [];
+// New or modified querySemanticGraph function
+async function querySemanticGraph(queryText: string, maxDepth: number = 2, similarityThreshold: number = 0.7): Promise<INode[]> {
     const lowerCaseQuery = queryText.toLowerCase();
+    const visitedNodes = new Set<string>();
+    const relevantNodes: INode[] = [];
+    const queue: { nodeId: string, depth: number }[] = [];
 
-    // Basic keyword matching for now
-    // We'll enhance this significantly later for LLM context.
+    
+    // --- Get embedding for the query text ---
+    const queryEmbedding = await getEmbedding(queryText, OPENAI_EMBEDDING_API_KEY);
+    
+
+    // --- Phase 1: Semantic & Keyword Matching (Seed Nodes) ---
+    console.log(`[SaralFlow Graph] Starting semantic and keyword matching for query "${queryText}".`);
     for (const node of semanticGraph.nodes) {
+        let isMatch = false;
+        let similarityScore = 0;
+
+        // Keyword Match
         if (node.label.toLowerCase().includes(lowerCaseQuery) ||
             node.kind.toLowerCase().includes(lowerCaseQuery) ||
-            node.id.toLowerCase().includes(lowerCaseQuery))
+            node.id.toLowerCase().includes(lowerCaseQuery) ||
+            node.uri.toLowerCase().includes(lowerCaseQuery))
         {
+            isMatch = true;
+        }
+
+        // Semantic Match (only if an embedding was successfully generated for the query)
+        if (queryEmbedding && node.label) { // Use node.detail or a combination of label/kind/snippet for embedding
+            // Generate embedding for node's text. You might want to cache these embeddings for performance.
+            // For first run, generate on-the-fly. For production, consider storing them.
+            const nodeTextForEmbedding = `${node.kind} ${node.label} || ''}`; // Combine relevant text
+            const nodeEmbedding = node.embedding;
+
+            if (nodeEmbedding) {
+                similarityScore = cosineSimilarity(queryEmbedding, nodeEmbedding);
+                if (similarityScore >= similarityThreshold) {
+                    console.log(`[SaralFlow Graph] Semantic match: Node "${node.label}" (Kind: ${node.kind}), Score: ${similarityScore.toFixed(3)}`);
+                    isMatch = true; // Mark as match if similarity is high
+                }
+            }
+        }
+
+        if (isMatch && !visitedNodes.has(node.id)) {
             relevantNodes.push(node);
+            visitedNodes.add(node.id);
+            queue.push({ nodeId: node.id, depth: 0 }); // Start traversal from this node
         }
     }
 
-    // You might also want to traverse related nodes from here
-    // For example, if a function is relevant, maybe its containing class and any functions it calls.
-    // This is where graph traversal algorithms would come in.
+    // --- Phase 2: Graph Traversal (BFS) (remains mostly the same) ---
+    console.log(`[SaralFlow Graph] Starting graph traversal for query "${queryText}" with maxDepth ${maxDepth}. Initial nodes: ${relevantNodes.length}`);
 
+    let head = 0;
+    while (head < queue.length) {
+        const { nodeId, depth } = queue[head++];
+
+        if (depth >= maxDepth) {
+            continue;
+        }
+
+        // Find connected nodes via outgoing edges
+        const outgoingEdges = semanticGraph.edges.filter(edge => edge.from === nodeId);
+        for (const edge of outgoingEdges) {
+            if (!visitedNodes.has(edge.to)) {
+                const connectedNode = semanticGraph.nodes.find(n => n.id === edge.to);
+                if (connectedNode) {
+                    relevantNodes.push(connectedNode);
+                    visitedNodes.add(connectedNode.id);
+                    queue.push({ nodeId: connectedNode.id, depth: depth + 1 });
+                }
+            }
+        }
+
+        // Find connected nodes via incoming edges
+        const incomingEdges = semanticGraph.edges.filter(edge => edge.to === nodeId);
+        for (const edge of incomingEdges) {
+            if (!visitedNodes.has(edge.from)) {
+                const connectedNode = semanticGraph.nodes.find(n => n.id === edge.from);
+                if (connectedNode) {
+                    relevantNodes.push(connectedNode);
+                    visitedNodes.add(connectedNode.id);
+                    queue.push({ nodeId: connectedNode.id, depth: depth + 1 });
+                }
+            }
+        }
+    }
+
+    // Optional: Sort nodes for consistent output (already present)
+    relevantNodes.sort((a, b) => {
+        if (a.uri !== b.uri) {
+            return a.uri.localeCompare(b.uri);
+        }
+        if (a.range && b.range) {
+            return a.range.start.line - b.range.start.line;
+        }
+        return 0;
+    });
+
+    console.log(`[SaralFlow Graph] Finished query. Found ${relevantNodes.length} relevant nodes.`);
     return relevantNodes;
 }
 
@@ -1072,3 +1128,457 @@ async function getCodeSnippet(node: INode): Promise<string> {
         return `// Error retrieving code snippet for ${node.label}: ${error.message}\n`;
     }
 }
+
+
+// Updated proposeCodeFromStory to send result to webview
+async function proposeCodeFromStory(userStory: string) {
+    if (!semanticGraph || !codeViewPanel) {
+        vscode.window.showErrorMessage('SaralFlow: Graph not built or Webview not active.');
+        return;
+    }
+
+    codeViewPanel.webview.postMessage({ command: 'showLoading' });
+    codeViewPanel.webview.postMessage({ command: 'clearResults' }); // Clear previous results
+
+    try {
+       
+        if (!OPENAI_CHAT_API_KEY) {
+            vscode.window.showErrorMessage('SaralFlow: API Key is required to call the LLM. Please set it first.');
+            codeViewPanel.webview.postMessage({ command: 'showError', text: 'API Key is required.' });
+            return;
+        }
+
+        const storyEmbedding = await getEmbedding(userStory, OPENAI_EMBEDDING_API_KEY);
+
+        if (!storyEmbedding) {
+            vscode.window.showErrorMessage('SaralFlow: Failed to generate embedding for the story. Please check your API key and try again.');
+            codeViewPanel.webview.postMessage({ command: 'showError', text: 'Failed to generate query embedding.' });
+            return;
+        }
+
+        const relevantNodes = findRelevantNodesByStory(storyEmbedding);
+
+        // Step 2: Fetch full file content for relevant nodes
+        const fileContentsMap = new Map<string, string>(); // Map of file path to its full content
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (workspaceFolders && workspaceFolders.length > 0) {
+            const rootPath = workspaceFolders[0].uri.fsPath;
+            for (const node of relevantNodes) {
+                const relativeFilePath = vscode.workspace.asRelativePath(vscode.Uri.parse(node.uri));
+                const fullFilePath = path.join(rootPath, relativeFilePath);
+                try {
+                    // Read the file content
+                    const fileUri = vscode.Uri.file(fullFilePath);
+                    const fileBuffer = await vscode.workspace.fs.readFile(fileUri);
+                    const fileContent = Buffer.from(fileBuffer).toString('utf8');
+                    fileContentsMap.set(relativeFilePath, fileContent);
+                } catch (error) {
+                    console.warn(`SaralFlow: Could not read file ${relativeFilePath} for context: ${error}`);
+                    // If we can't read the file, perhaps still provide the node.codeSnippet as fallback context
+                    if (node.codeSnippet) {
+                        fileContentsMap.set(relativeFilePath, node.codeSnippet); // Fallback: use just the snippet
+                    }
+                }
+            }
+        }
+
+        const prompt = createStoryPrompt(userStory, fileContentsMap);
+
+        const llmResponse = await callLLM(prompt, OPENAI_CHAT_API_KEY);
+
+        // Parse the LLM response into structured changes and the explanation
+        const { fileChanges, explanation } = await parseLLMResponse(llmResponse);
+        lastProposedChanges = fileChanges; // Store for application
+
+        // Send the result back to the webview
+        codeViewPanel.webview.postMessage({
+            command: 'displayParsedResult',
+            fileChanges: fileChanges,
+            explanation: explanation
+        });
+
+        vscode.window.showInformationMessage('SaralFlow: Code generation complete.');
+
+    } catch (error: any) {
+        vscode.window.showErrorMessage(`SaralFlow: Failed to generate code: ${error.message}`);
+        console.error(`SaralFlow: Code generation failed: ${error.message}`);
+        codeViewPanel.webview.postMessage({ command: 'showError', text: `Error: ${error.message}` });
+    } finally {
+        codeViewPanel.webview.postMessage({ command: 'hideLoading' });
+    }
+}
+
+function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
+    if (!semanticGraph) { return []; }
+
+    const relevantNodes: { node: INode, score: number }[] = [];
+    const topN = 10; // Number of top relevant nodes to include as context
+
+    for (const node of semanticGraph.nodes) {
+        if (node.embedding) {
+            const similarity = cosineSimilarity(storyEmbedding, node.embedding);
+            relevantNodes.push({ node, score: similarity });
+        }
+    }
+
+    relevantNodes.sort((a, b) => b.score - a.score);
+
+    return relevantNodes.slice(0, topN).map(r => r.node);
+}
+
+// Updated createStoryPrompt signature to accept the map
+function createStoryPrompt(userStory: string, relevantFileContents: Map<string, string>): string {
+    let prompt = "You are an expert software developer. Your task is to implement a new feature or change based on a user story and provided code context. Your response should contain markdown code blocks, each representing the *full content* of a file that needs to be created or modified. Use explicit markers for each file. After all code blocks, provide a brief markdown explanation of how to apply the changes.\n\n";
+
+    prompt += `**User Story:**\n${userStory}\n\n`;
+
+    if (relevantFileContents.size > 0) {
+        prompt += "**Relevant Code Context (Full File Contents):**\n";
+        for (const [filePath, content] of relevantFileContents.entries()) {
+            prompt += `--- Context File: ${filePath} ---\n`;
+            prompt += `\`\`\`csharp\n${content}\n\`\`\`\n\n`;
+        }
+    } else {
+        prompt += "No relevant code context could be found or provided.\n\n";
+    }
+
+    prompt += "--- Proposed Changes ---\n\n";
+    prompt += "For each file to be created or modified, provide its full relative path and its complete, modified content within a C# markdown block. Use `--- START FILE: <relative/path/to/file.cs> ---` and `--- END FILE: <relative/path/to/file.cs> ---` markers.\n";
+    prompt += "After all file changes, provide a clear 'Explanation:' section detailing the overall approach and how to integrate the changes.\n\n";
+
+    prompt += "Example Output Format:\n\n";
+    prompt += "```\n";
+    prompt += "--- START FILE: src/NewFeature/NewService.cs ---\n";
+    prompt += "```csharp\n";
+    prompt += "// Full content of the new file\n";
+    prompt += "public class NewService { /* ... */ }\n";
+    prompt += "```\n";
+    prompt += "--- END FILE: src/NewFeature/NewService.cs ---\n\n";
+    prompt += "--- START FILE: src/Existing/ExistingController.cs ---\n";
+    prompt += "```csharp\n";
+    prompt += "// Full content of the existing file, with your modifications merged in\n";
+    prompt += "public class ExistingController { /* ... modified code ... */ }\n";
+    prompt += "```\n";
+    prompt += "--- END FILE: src/Existing/ExistingController.cs ---\n\n";
+    prompt += "Explanation:\n";
+    prompt += "This change introduces NewService.cs and updates ExistingController.cs to use it...\n";
+
+    return prompt;
+}
+
+// (The `callLLM` function remains the same)
+
+async function displayLLMResponseAsNewFile(llmResponse: string) {
+    const doc = await vscode.workspace.openTextDocument({ content: llmResponse, language: 'markdown' });
+    await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
+}
+
+async function callLLM(prompt: string, apiKey: string): Promise<string> {
+    // This is a simplified example. You'll need to use an actual library like 'openai' or 'ollama'
+    // This function should be in your `embeddingService.ts` or a new `llmService.ts`.
+
+    // Assuming you're using OpenAI's chat completion API
+    const { OpenAI } = require('openai'); // Make sure 'openai' is installed
+    const openai = new OpenAI({ apiKey: apiKey });
+
+    try {
+        const response = await openai.chat.completions.create({
+            model: "gpt-4o-mini", // Or gpt-4, gpt-3.5-turbo, etc.
+            messages: [{
+                role: "system",
+                content: "You are an expert software developer. Your task is to propose a code change based on a user request and provided code context. Your response should be a markdown code block containing the proposed code, followed by a brief markdown explanation of the change."
+            }, {
+                role: "user",
+                content: prompt
+            }],
+            temperature: 0.1, // Keep it low for more deterministic code
+        });
+        
+        return response.choices[0]?.message?.content || "No response from LLM.";
+    } catch (error: any) {
+        throw new Error(`LLM API call failed: ${error.message}`);
+    }
+}
+
+
+// This function is responsible for creating and managing the webview panel
+function openSaralFlowWebview(extensionUri: vscode.Uri) {
+    // If a panel already exists, just reveal it
+    if (codeViewPanel) {
+        codeViewPanel.reveal(vscode.ViewColumn.Beside);
+        return;
+    }
+
+    // *** THIS IS THE CRITICAL PART ***
+    // codeViewPanel is assigned here. After this line, within this function,
+    // TypeScript knows it's no longer undefined.
+    codeViewPanel = vscode.window.createWebviewPanel(
+        'saralFlowGenerator', // type
+        'SaralFlow Code Generator', // title
+        vscode.ViewColumn.Beside, // column
+        {
+            enableScripts: true,
+            localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'codeview')] // Ensure this is correct
+        }
+    );
+
+    // Set the HTML content
+    codeViewPanel.webview.html = getCodeViewContent(codeViewPanel.webview, extensionUri);
+
+    // Attach the message listener to the newly created and *definitely defined* panel
+    codeViewPanel.webview.onDidReceiveMessage(
+        async message => {
+            switch (message.command) {
+                case 'generateCode':
+                    // We need to ensure proposeCodeFromStory also handles codeViewPanel potentially being undefined
+                    // if this callback gets invoked after the panel has been disposed.
+                    await proposeCodeFromStory(message.text);
+                    break; // Use break, not return, if you have more cases after this
+                case 'applyAllChanges':
+                    if (lastProposedChanges.length > 0) {
+                        await applyCodeChanges(lastProposedChanges);
+                    } else {
+                        vscode.window.showWarningMessage('No proposed changes to apply.');
+                    }
+                    break;
+            }
+        },
+        undefined, // This 'thisArg' is optional
+        extensionContext.subscriptions // Crucial for clean up
+    );
+
+    // Set up cleanup when the panel is closed by the user
+    codeViewPanel.onDidDispose(() => {
+        codeViewPanel = undefined; // Set it back to undefined when disposed
+    }, null, extensionContext.subscriptions);
+}
+
+// Helper to get the HTML content for the Webview
+function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
+    // Local path to main script run in the webview
+    const scriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'main.js');
+    const markedScriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'marked.min.js'); // Assuming marked.min.js is also in codeview
+    const stylePathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'styles.css');
+
+    // And the uri to the script and style for the webview
+    const scriptUri = webview.asWebviewUri(scriptPathOnDisk);
+    const markedUri = webview.asWebviewUri(markedScriptPathOnDisk);
+    const styleUri = webview.asWebviewUri(stylePathOnDisk);
+
+    // Use a nonce to only allow a specific script to be run.
+    const nonce = getNonce();
+
+    return `<!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+                <link href="${styleUri}" rel="stylesheet">
+                <title>SaralFlow Code Generator</title>
+            </head>
+            <body>
+                <h1>SaralFlow: Story to Code</h1>
+                <p>Describe the feature or change you want to implement:</p>
+                <textarea id="userStory" rows="10" cols="60" placeholder="e.g., 'As a user, I want to add a new API endpoint that lists all products with a 'special' tag.'"></textarea>
+                <br>
+                <button id="generateButton">Generate Code</button>
+                <hr>
+                <h2>Proposed Code Change:</h2>
+                <div id="loadingMessage" style="display:none;">Generating...</div>
+                <div id="result"></div>
+
+                <script nonce="${nonce}" src="${markedUri}"></script>
+                <script nonce="${nonce}" src="${scriptUri}"></script>
+            </body>
+            </html>`;
+}
+
+// Utility to generate a nonce for Content Security Policy
+function getNonce() {
+    let text = '';
+    const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    for (let i = 0; i < 32; i++) {
+        text += possible.charAt(Math.floor(Math.random() * possible.length));
+    }
+    return text;
+}
+
+// NEW: Function to parse LLM response into structured changes and explanation
+interface ProposedFileChange {
+    filePath: string;
+    content: string; // The full proposed content of the file
+    isNewFile: boolean;
+}
+
+interface ParsedLLMResponse {
+    fileChanges: ProposedFileChange[];
+    explanation: string;
+}
+
+async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMResponse> {
+    const fileChanges: ProposedFileChange[] = [];
+    let explanation = '';
+    const lines = llmResponse.split('\n');
+    let currentFilePath: string | null = null;
+    let currentContent: string[] = [];
+    let inCodeBlock = false;
+    let parsingExplanation = false;
+
+    const startFileMarker = '--- START FILE: ';
+    const endFileMarker = '--- END FILE: ';
+    const codeBlockStart = '```csharp'; // Assuming C#
+    const codeBlockEnd = '```';
+    const explanationStart = 'Explanation:';
+
+    for (const line of lines) {
+        if (line.startsWith(startFileMarker)) {
+            if (inCodeBlock && currentFilePath) {
+                // If we were in a code block and hit a new file marker, save the previous one
+                fileChanges.push({
+                    filePath: currentFilePath,
+                    content: currentContent.join('\n'),
+                    isNewFile: true // Assume new for now, will differentiate later
+                });
+            }
+            currentFilePath = line.substring(startFileMarker.length, line.indexOf(' ---', startFileMarker.length)).trim();
+            currentContent = [];
+            inCodeBlock = false; // Reset code block flag
+            parsingExplanation = false; // Stop parsing explanation if a new file starts
+        } else if (line.startsWith(endFileMarker)) {
+            if (currentFilePath && currentContent.length > 0) {
+                fileChanges.push({
+                    filePath: currentFilePath,
+                    content: currentContent.join('\n'),
+                    isNewFile: false // Will determine this later by checking if file exists
+                });
+            }
+            currentFilePath = null;
+            currentContent = [];
+            inCodeBlock = false; // Ensure we are out of code block
+        } else if (line.trim() === codeBlockStart.trim()) {
+            inCodeBlock = true;
+        } else if (line.trim() === codeBlockEnd.trim()) {
+            inCodeBlock = false;
+        } else if (line.startsWith(explanationStart)) {
+            parsingExplanation = true;
+            explanation = line.substring(explanationStart.length).trim() + '\n';
+        } else if (parsingExplanation) {
+            explanation += line + '\n';
+        } else if (inCodeBlock && currentFilePath !== null) {
+            currentContent.push(line);
+        }
+    }
+
+    // A final check in case the LLM doesn't end with --- END FILE ---
+    if (currentFilePath && currentContent.length > 0) {
+        fileChanges.push({
+            filePath: currentFilePath,
+            content: currentContent.join('\n'),
+            isNewFile: false // Default to false, check real file system later
+        });
+    }
+
+    // Now, determine isNewFile based on actual file existence
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (workspaceFolders && workspaceFolders.length > 0) {
+        const rootPath = workspaceFolders[0].uri.fsPath;
+        for (const change of fileChanges) {
+            const fullPath = path.join(rootPath, change.filePath);
+            const fileExists = vscode.workspace.fs.stat(vscode.Uri.file(fullPath)).then(
+                () => true,
+                (err) => err.code === 'FileNotFound' ? false : true // Treat other errors as file existing for safety
+            );
+            change.isNewFile = !(await fileExists); // Mark as new if it doesn't exist
+        }
+    }
+    
+    return { fileChanges, explanation: explanation.trim() };
+}
+
+
+async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        vscode.window.showErrorMessage('No workspace folder open to apply changes.');
+        return;
+    }
+    const rootPath = workspaceFolders[0].uri.fsPath;
+    const dmp = new DiffMatchPatch.DiffMatchPatch();  // Instance of DiffMatchPatch
+
+    const edit = new vscode.WorkspaceEdit();
+    let filesOpenedCount = 0;
+
+    for (const change of changesToApply) {
+        const fullPath = path.join(rootPath, change.filePath);
+        const fileUri = vscode.Uri.file(fullPath);
+
+        if (change.isNewFile) {
+            edit.createFile(fileUri, { ignoreIfExists: false });
+            edit.insert(fileUri, new vscode.Position(0, 0), change.content);
+            vscode.window.showInformationMessage(`Proposed new file: ${change.filePath}`);
+            filesOpenedCount++;
+        } else {
+            try {
+                const existingDoc = await vscode.workspace.openTextDocument(fileUri);
+                const originalText = existingDoc.getText();
+                const proposedText = change.content;
+
+                const diffs = dmp.diff_main(originalText, proposedText);
+                dmp.diff_cleanupSemantic(diffs);
+
+                let currentOffset = 0;
+                for (const diff of diffs) {
+                    const type = diff[0]; // -1: deletion, 0: equality, 1: insertion
+                    const text = diff[1];
+
+                    // --- CHANGE THESE LINES ---
+                    if (type === 0) { // Equivalent to dmp.DIFF_EQUAL
+                        currentOffset += text.length;
+                    } else if (type === 1) { // Equivalent to dmp.DIFF_INSERT
+                        const startPos = existingDoc.positionAt(currentOffset);
+                        edit.insert(fileUri, startPos, text);
+                    } else if (type === -1) { // Equivalent to dmp.DIFF_DELETE
+                        const startPos = existingDoc.positionAt(currentOffset);
+                        const endPos = existingDoc.positionAt(currentOffset + text.length);
+                        edit.delete(fileUri, new vscode.Range(startPos, endPos));
+                        currentOffset += text.length;
+                    }
+                }
+                vscode.window.showInformationMessage(`Proposed changes to: ${change.filePath}`);
+                filesOpenedCount++;
+
+            } catch (error: any) {
+                vscode.window.showErrorMessage(`Failed to prepare changes for ${change.filePath}: ${error.message}`);
+                console.error(`Error preparing diff for ${change.filePath}: ${error.message}`);
+                continue;
+            }
+        }
+    }
+
+    if (filesOpenedCount === 0) {
+        vscode.window.showWarningMessage('No changes to apply or no files could be processed.');
+        return;
+    }
+
+    // Apply the combined edit
+    const success = await vscode.workspace.applyEdit(edit);
+
+    if (success) {
+        vscode.window.showInformationMessage('SaralFlow: Code changes applied successfully!');
+        // Optional: Open all modified/new files in editor
+        for (const change of changesToApply) {
+            const fullPath = path.join(rootPath, change.filePath);
+            const fileUri = vscode.Uri.file(fullPath);
+            try {
+                const doc = await vscode.workspace.openTextDocument(fileUri);
+                await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: false });
+            } catch (e) {
+                console.warn(`Could not open file ${change.filePath}: ${e}`);
+            }
+        }
+    } else {
+        vscode.window.showErrorMessage('SaralFlow: Failed to apply code changes.');
+    }
+}
+

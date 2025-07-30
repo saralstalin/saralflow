@@ -153,22 +153,25 @@ export function toNodeKind(symbolKind: vscode.SymbolKind): NodeKind {
     return NodeKind.Reference;
 }
 
-// Define your graph node and edge interfaces
-// We've expanded INode to hold crucial semantic data for later retrieval
 export interface INode {
-    id: string; // Unique ID for the node (e.g., file URI + symbol FQN)
-    label: string; // Display label (e.g., file name, symbol name)
-    kind: string; // Type of element (e.g., 'File', 'Class', 'Method', 'Variable')
-    uri: string; // URI of the file this node represents or belongs to
-    range?: { start: { line: number, character: number }, end: { line: number, character: number } }; // Location of the element in the file
-    parentIds?: string[]; // To track hierarchy, useful for displaying nested structure
-    // Add other properties relevant to your LLM context retrieval
-    // For example, if you want to store full function signatures, docstrings, etc.
-    // codeSnippet?: string; // Could store the actual code lines here if pre-extracted
+    id: string;
+    label: string;
+    kind: string;
+    detail?: string;
+    uri: string;
+    range?: { start: { line: number, character: number }, end: { line: number, character: number } }; 
+    codeSnippet?: string;
+    parentIds?: string[];
+    embedding?: number[]; 
 }
 
 export interface IEdge {
     from: string; // ID of the source node
     to: string; // ID of the target node
     label?: string; // Type of relationship (e.g., 'CONTAINS', 'CALLS', 'REFERENCES', 'INHERITS')
+}
+
+export interface ISemanticGraph {
+    nodes: INode[];
+    edges: IEdge[];
 }
