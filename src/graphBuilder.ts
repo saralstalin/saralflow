@@ -220,36 +220,59 @@ export async function extractSemanticGraph(): Promise<ISemanticGraph> {
     vscode.window.showInformationMessage(`SaralFlow Graph: Generating embeddings for ${nodes.length} nodes (this may take a while)...`);
 
     let embeddedNodesCount = 0;
+    const nodesToEmbed: { node: INode; textToEmbed: string }[] = [];
+
+    // First, collect all the nodes that need an embedding and prepare the text
     for (const node of nodes) {
-        if (useEmbeddings && node.codeSnippet) { // Only embed if API key is present AND we have a code snippet
-            try {
-                // Combine relevant text for embedding: label, kind, and the actual code snippet
-                // You can adjust this combination based on what you want to emphasize in embeddings
-                const textToEmbed = `${node.kind}: ${node.label}\n${node.detail || ''}\n${node.codeSnippet}`;
+        if (useEmbeddings && node.codeSnippet) {
+            // Combine relevant text for embedding
+            const textToEmbed = `${node.kind}: ${node.label}\n${node.detail || ''}\n${node.codeSnippet}`;
 
-                // Optional: Trim long snippets to avoid hitting token limits for embedding models
-                // OpenAI's text-embedding-3-small supports 8191 tokens
-                const maxEmbedTextLength = 8000; // Example, adjust based on model limits
-                const truncatedText = textToEmbed.length > maxEmbedTextLength ?
-                    textToEmbed.substring(0, maxEmbedTextLength) : textToEmbed;
+            // Optional: Trim long snippets to avoid hitting token limits
+            const maxEmbedTextLength = 8000;
+            const truncatedText = textToEmbed.length > maxEmbedTextLength ?
+                textToEmbed.substring(0, maxEmbedTextLength) : textToEmbed;
 
-                const embedding = await getEmbedding(truncatedText, apiKey!);
-                if (embedding) {
-                    node.embedding = embedding;
-                    embeddedNodesCount++;
-                } else {
-                    console.warn(`[SaralFlow Graph] Failed to generate embedding for node: ${node.label} (${node.kind}). No embedding returned.`);
-                }
-            } catch (embedError: any) {
-                console.error(`[SaralFlow Graph] Error embedding node ${node.label} (${node.kind}) from ${node.uri} at range ${node.range ? `${node.range.start.line}:${node.range.start.character}` : 'N/A'}: ${embedError.message}`);
-            }
+            nodesToEmbed.push({ node, textToEmbed: truncatedText });
         } else if (useEmbeddings && !node.codeSnippet) {
-            console.warn(`[SaralFlow Graph] Skipping embedding for node ${node.label} (no code snippet available or file node).`);
-        } else if (!useEmbeddings) {
-            // Already warned at the start if API key is missing
+            // This is a good place for a more verbose log if needed, but let's keep it clean
+            // console.warn(`[SaralFlow Graph] Skipping embedding for node ${node.label} (no code snippet available).`);
         }
     }
+
+    // --- NEW PARALLEL EMBEDDING SECTION ---
+
+    if (nodesToEmbed.length > 0) {
+        console.log(`[SaralFlow Graph] Starting parallel embedding for ${nodesToEmbed.length} nodes...`);
+
+        // Create an array of Promises for each embedding call
+        const embeddingPromises = nodesToEmbed.map(item =>
+            getEmbedding(item.textToEmbed, apiKey!)
+                .then(embedding => ({ node: item.node, embedding })) // Attach the original node to the result
+                .catch(error => {
+                    // Log the error for this specific node and return null for the embedding
+                    console.error(`[SaralFlow Graph] Error embedding node ${item.node.label}: ${error.message}`);
+                    return { node: item.node, embedding: null };
+                })
+        );
+
+        // Wait for all promises to resolve in parallel
+        const embeddingResults = await Promise.all(embeddingPromises);
+
+        // Now, iterate through the results and update the nodes
+        for (const result of embeddingResults) {
+            if (result.embedding) {
+                result.node.embedding = result.embedding;
+                embeddedNodesCount++;
+            }
+        }
+        
+        console.log(`[SaralFlow Graph] Finished embedding. Successfully embedded ${embeddedNodesCount} nodes.`);
+    } else {
+    console.log('[SaralFlow Graph] No nodes found to embed or embeddings were disabled.');
+    }
     console.log(`[SaralFlow Graph] Finished generating node embeddings. Successfully embedded ${embeddedNodesCount} nodes.`);
+    
     vscode.window.showInformationMessage(`SaralFlow Graph: Generated embeddings for ${embeddedNodesCount} nodes.`);
 
 

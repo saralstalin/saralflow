@@ -124,14 +124,13 @@ window.addEventListener('message', event => {
 
         case 'showLoading':
             console.log('Command: showLoading');
-            // Assuming .hidden class is used for display: none
-            if (loadingMessage) loadingMessage.classList.remove('hidden');
-            resultDiv.innerHTML = ''; // Clear results while loading
+            if (loadingMessage) {loadingMessage.innerHTML ="Generating Code Changes...";};
+            resultDiv.innerHTML = '';
             applyAllButton.style.display = 'none';
             break;
         case 'hideLoading':
             console.log('Command: hideLoading');
-            if (loadingMessage) loadingMessage.classList.add('hidden');
+            if (loadingMessage) {loadingMessage.innerHTML ="";};
             break;
         case 'showError':
             console.log('Command: showError', message.text);

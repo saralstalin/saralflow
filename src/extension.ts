@@ -5,9 +5,11 @@ import { CodeGraph, GraphNode, GraphEdge, INode, IEdge, NodeKind, EdgeType, gene
 import { getEmbedding, cosineSimilarity } from'./embeddingService';
 import fetch from 'node-fetch';
 const DiffMatchPatch: any = require('diff-match-patch'); 
+import pLimit from 'p-limit';
 
 // Keep track of the last parsed changes to apply them
 let lastProposedChanges: ProposedFileChange[] = [];
+const limit = pLimit(10);
 
 import {extractSemanticGraph, processDocumentSymbols, fetchAndProcessCallHierarchy} from './graphBuilder';
 
@@ -508,16 +510,12 @@ async function loadSchemaContext() {
     sqlFilesBaseUri = undefined; // Clear existing base URI
 
     try {
-        // Find the 'dbo' folder first to establish the base path for SQL files
-        // Adjust the glob pattern to find 'dbo' within any subfolder of the workspace root
-        const dboFolders = await vscode.workspace.findFiles('**/dbo', '**/node_modules/**', 1); // Find one dbo folder
+        const dboFolders = await vscode.workspace.findFiles('**/dbo', '**/node_modules/**', 1);
 
         if (dboFolders.length > 0) {
-            // Use the first found 'dbo' folder as the base URI
-            sqlFilesBaseUri = dboFolders[0]; 
+            sqlFilesBaseUri = dboFolders[0];
             vscode.window.showInformationMessage(`Found SQL base folder: ${sqlFilesBaseUri.fsPath}`);
         } else if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-            // Fallback: If no 'dbo' folder, assume SQL files are directly under the workspace root
             sqlFilesBaseUri = vscode.workspace.workspaceFolders[0].uri;
             vscode.window.showWarningMessage('Could not find a "dbo" folder. Assuming SQL files are relative to workspace root.');
         } else {
@@ -526,8 +524,6 @@ async function loadSchemaContext() {
             return;
         }
 
-        // Now, find all .sql files within the determined base URI (or entire workspace if no dbo)
-        // We'll filter later if findFiles returns outside the desired base.
         const sqlFiles = await vscode.workspace.findFiles('**/*.sql', '**/node_modules/**', 100);
 
         if (sqlFiles.length === 0) {
@@ -536,8 +532,6 @@ async function loadSchemaContext() {
             return;
         }
 
-        // Filter files to ensure they are under the identified sqlFilesBaseUri
-        // This ensures we only process SQL files relevant to the detected 'dbo' structure.
         const relevantSqlFiles = sqlFiles.filter(fileUri => fileUri.fsPath.startsWith(sqlFilesBaseUri!.fsPath));
 
         if (relevantSqlFiles.length === 0) {
@@ -546,38 +540,49 @@ async function loadSchemaContext() {
             return;
         }
 
-
         vscode.window.showInformationMessage(`Found ${relevantSqlFiles.length} relevant .sql files for context. Generating embeddings... This might take a moment.`);
-
-        let processedChunks: { text: string, embedding: number[] }[] = [];
-        for (const fileUri of relevantSqlFiles) { // Iterate over filtered files
+        
+        let allChunks: { text: string; fileUri: vscode.Uri }[] = [];
+        for (const fileUri of relevantSqlFiles) {
             try {
                 const fileContent = await vscode.workspace.fs.readFile(fileUri);
                 const sqlText = new TextDecoder().decode(fileContent);
-
-                // Simple chunking: Split by common DDL/DML keywords to get logical blocks
+                
+                // Chunking logic remains the same
                 const chunks = sqlText.split(/(CREATE TABLE|ALTER TABLE|CREATE PROCEDURE|ALTER PROCEDURE|INSERT INTO|UPDATE|DELETE FROM)\s/gi)
-                                      .filter(chunk => chunk.trim().length > 0)
-                                      .map((chunk, index, arr) => {
-                                          // Re-attach the keyword that was used for splitting
-                                          if (index > 0 && arr[index - 1].match(/^(CREATE TABLE|ALTER TABLE|CREATE PROCEDURE|ALTER PROCEDURE|INSERT INTO|UPDATE|DELETE FROM)$/i)) {
-                                              return arr[index - 1] + ' ' + chunk;
-                                          }
-                                          return chunk;
-                                      })
-                                      .filter(chunk => chunk.trim().length > 0);
+                                     .filter(chunk => chunk.trim().length > 0)
+                                     .map((chunk, index, arr) => {
+                                        if (index > 0 && arr[index - 1].match(/^(CREATE TABLE|ALTER TABLE|CREATE PROCEDURE|ALTER PROCEDURE|INSERT INTO|UPDATE|DELETE FROM)$/i)) {
+                                            return arr[index - 1] + ' ' + chunk;
+                                        }
+                                        return chunk;
+                                     })
+                                     .filter(chunk => chunk.trim().length > 0);
 
                 for (const chunk of chunks) {
-                    const embedding = await getEmbedding(chunk, OPENAI_EMBEDDING_API_KEY);
-                    if (embedding) {
-                        processedChunks.push({ text: chunk, embedding: embedding });
-                    }
+                    allChunks.push({ text: chunk, fileUri: fileUri });
                 }
             } catch (readError: any) {
                 console.warn(`Could not process file ${fileUri.fsPath}: ${readError.message}`);
             }
         }
-        cachedSchemaChunks = processedChunks; // Update the global cache
+        
+        // --- THIS IS THE NEW PARALLEL EMBEDDING SECTION ---
+        
+        // 1. Create an array of Promises for each embedding call
+        const embeddingPromises = allChunks.map(chunkInfo => 
+            getEmbedding(chunkInfo.text, OPENAI_EMBEDDING_API_KEY)
+                .then(embedding => ({ text: chunkInfo.text, embedding })) // Attach the original chunk text to the result
+        );
+
+        // 2. Wait for all promises to resolve in parallel
+        const results = await Promise.all(embeddingPromises);
+
+        // 3. Filter out any failed embedding calls (where embedding is undefined)
+        cachedSchemaChunks = results.filter(result => result.embedding !== undefined) as { text: string; embedding: number[] }[];
+        
+        // --- END OF NEW SECTION ---
+        
         vscode.window.showInformationMessage(`Generated embeddings for ${cachedSchemaChunks.length} schema chunks. Context ready.`);
     } catch (error: any) {
         console.error('Error finding, reading, or embedding SQL files:', error);
@@ -1318,7 +1323,8 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
         vscode.ViewColumn.Beside, // column
         {
             enableScripts: true,
-            localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'codeview')] // Ensure this is correct
+            localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'codeview')], // Ensure this is correct,
+            retainContextWhenHidden: true
         }
     );
 
@@ -1328,11 +1334,36 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
     // Attach the message listener to the newly created and *definitely defined* panel
     codeViewPanel.webview.onDidReceiveMessage(
         async message => {
+            if (!codeViewPanel || !codeViewPanel.webview) {
+                console.warn('[Extension] Message received after codeViewPanel was disposed. Skipping.');
+                return; // Exit the function gracefully
+            }
             switch (message.command) {
                 case 'generateCode':
                     // We need to ensure proposeCodeFromStory also handles codeViewPanel potentially being undefined
                     // if this callback gets invoked after the panel has been disposed.
-                    await proposeCodeFromStory(message.text);
+                    try {
+
+                        codeViewPanel.webview.postMessage({ command: 'showLoading' });
+                        await proposeCodeFromStory(message.text);
+                    }
+                    catch (error) {
+                        // Step 4: If an error occurs, send an error message to the webview
+                        let errorMessage = 'Failed to generate code: An unknown error occurred.';
+                        if (error instanceof Error)
+                        {
+                          errorMessage = `Failed to generate code: ${error.message}`;
+                        }
+                        console.error('[Extension] An error occurred during LLM generation.', error);
+                        codeViewPanel.webview.postMessage({
+                            command: 'showError',
+                            text: errorMessage,
+                        });
+                    }
+                    finally{
+                        codeViewPanel.webview.postMessage({ command: 'hideLoading' });
+                    }
+                    
                     break; // Use break, not return, if you have more cases after this
                 case 'applyAllChanges':
                     if (lastProposedChanges.length > 0) {
@@ -1385,7 +1416,7 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
                 <button id="generateButton">Generate Code</button>
                 <hr>
                 <h2>Proposed Code Change:</h2>
-                <div id="loadingMessage" style="display:none;">Generating...</div>
+                <div id="loadingMessage" style="display:none;"></div>
                 <div id="result"></div>
 
                 <script nonce="${nonce}" src="${markedUri}"></script>
