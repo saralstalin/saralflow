@@ -4,7 +4,7 @@ import * as path from 'path'; // Import the 'path' module
 import { CodeGraph, GraphNode, GraphEdge, INode, IEdge, NodeKind, EdgeType, generateNodeId, toNodeKind } from './graphTypes'; 
 import { getEmbedding, cosineSimilarity } from'./embeddingService';
 import fetch from 'node-fetch';
-import DiffMatchPatch from 'diff-match-patch';
+const DiffMatchPatch: any = require('diff-match-patch'); 
 
 // Keep track of the last parsed changes to apply them
 let lastProposedChanges: ProposedFileChange[] = [];
@@ -1504,7 +1504,7 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
         return;
     }
     const rootPath = workspaceFolders[0].uri.fsPath;
-    const dmp = new DiffMatchPatch.DiffMatchPatch();  // Instance of DiffMatchPatch
+    const dmp = new DiffMatchPatch(); // Try this first
 
     const edit = new vscode.WorkspaceEdit();
     let filesOpenedCount = 0;
