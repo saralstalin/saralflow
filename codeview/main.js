@@ -124,13 +124,13 @@ window.addEventListener('message', event => {
 
         case 'showLoading':
             console.log('Command: showLoading');
-            if (loadingMessage) {loadingMessage.innerHTML ="Generating Code Changes...";};
+            if (loadingMessage) {loadingMessage.classList.remove('hidden');};
             resultDiv.innerHTML = '';
             applyAllButton.style.display = 'none';
             break;
         case 'hideLoading':
             console.log('Command: hideLoading');
-            if (loadingMessage) {loadingMessage.innerHTML ="";};
+            if (loadingMessage) {loadingMessage.classList.add('hidden');};
             break;
         case 'showError':
             console.log('Command: showError', message.text);

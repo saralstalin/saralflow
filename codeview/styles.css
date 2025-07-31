@@ -62,3 +62,7 @@ button:hover {
     font-style: italic;
     margin-top: 10px;
 }
+
+.hidden {
+    display: none !important;
+}

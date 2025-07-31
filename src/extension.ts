@@ -100,7 +100,7 @@ export function activate(context: vscode.ExtensionContext) {
     memGraphStatusBarItem.show();
     context.subscriptions.push(memGraphStatusBarItem);
 
-
+    
     // *** Initial Graph Building on Activation ***
     let buildGraphDisposable = vscode.commands.registerCommand('SaralFlow.buildGraphOnStartup', async () => {
         if (isGraphBuilding) {
@@ -484,6 +484,14 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.commands.registerCommand('SaralFlow.openGenerator', () => {
         openSaralFlowWebview(context.extensionUri);
     }));
+
+    // Create a status bar item
+    const saralCodeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+    saralCodeStatusBarItem.text = `$(robot) SaralCode`;
+    saralCodeStatusBarItem.tooltip = 'Show Saral Code';
+    saralCodeStatusBarItem.command = 'SaralFlow.openGenerator'; // Link to the new command
+    saralCodeStatusBarItem.show();
+    context.subscriptions.push(saralCodeStatusBarItem);
 
     // Add a status bar item for quick access to the SQL Generator
     const sqlStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
@@ -1388,7 +1396,7 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
 function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     // Local path to main script run in the webview
     const scriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'main.js');
-    const markedScriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'marked.min.js'); // Assuming marked.min.js is also in codeview
+    const markedScriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'marked.min.js'); 
     const stylePathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'styles.css');
 
     // And the uri to the script and style for the webview
@@ -1404,7 +1412,7 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
                 <link href="${styleUri}" rel="stylesheet">
                 <title>SaralFlow Code Generator</title>
             </head>
@@ -1416,7 +1424,8 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
                 <button id="generateButton">Generate Code</button>
                 <hr>
                 <h2>Proposed Code Change:</h2>
-                <div id="loadingMessage" style="display:none;"></div>
+                <!-- CRITICAL CHANGE: Removed the inline style and added a 'hidden' class. -->
+                <div id="loadingMessage" class="hidden">Generating Code Changes... Please wait.</div>
                 <div id="result"></div>
 
                 <script nonce="${nonce}" src="${markedUri}"></script>
@@ -1424,6 +1433,7 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
             </body>
             </html>`;
 }
+
 
 // Utility to generate a nonce for Content Security Policy
 function getNonce() {
