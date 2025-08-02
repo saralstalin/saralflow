@@ -6,7 +6,7 @@ import pLimit from 'p-limit';
 
 import { CodeGraph,  INode, IEdge } from './graphTypes'; 
 import { getEmbedding, cosineSimilarity } from'./embeddingService';
-import {extractSemanticGraph, processDocumentSymbols, fetchAndProcessCallHierarchy, processFileAndAddToGraph, removeFileNodesFromGraph} from './graphBuilder';
+import {extractSemanticGraph, rebuildFileReferences, processFileAndAddToGraph, removeFileNodesFromGraph, rebuildAffectedReferences} from './graphBuilder';
 
 
 const DiffMatchPatch: any = require('diff-match-patch'); 
@@ -291,7 +291,7 @@ export function activate(context: vscode.ExtensionContext) {
                 contextForLLM += `// File: ${vscode.workspace.asRelativePath(vscode.Uri.parse(node.uri))}\n`;
                 contextForLLM += `// Element: ${node.label} (Kind: ${node.kind})\n`;
                 contextForLLM += `// ID: ${node.id}\n`;
-                contextForLLM += `\`\`\`${node.uri.endsWith('.cs') ? 'csharp' : node.uri.endsWith('.ts') ? 'typescript' : 'plaintext'}\n`;
+                contextForLLM += `\`\`\`${node.uri.endsWith('.cs') ? 'csharp' : node.uri.endsWith('.ts') ? 'typescript':  node.uri.endsWith('.sql') ? 'sql' :  node.uri.endsWith('.py') ? 'python' : 'plaintext'}\n`;
                 contextForLLM += snippet;
                 contextForLLM += `\n\`\`\`\n\n`;
                 snippetCount++;
@@ -519,11 +519,27 @@ export function activate(context: vscode.ExtensionContext) {
         }
         graphUpdateTimeout = setTimeout(async () => {
             vscode.window.showInformationMessage(`SaralFlow: File change detected in ${vscode.workspace.asRelativePath(uri)}. Updating graph...`);
-            // Call your new incremental update function here
-            removeFileNodesFromGraph(uri);
-            await processFileAndAddToGraph(uri);
+            
+            // Step 1: Remove all nodes and edges for the old version of the file and get the removed edges.
+            const removedEdges = removeFileNodesFromGraph(uri);
+            
+            // Step 2: Process the file and add the new nodes and internal ('CONTAINS') edges.
+            const newNodesInFile = await processFileAndAddToGraph(uri);
+
+            // Step 3: Rebuild relationships only for the affected nodes (removed and newly added).
+            await rebuildAffectedReferences(removedEdges, newNodesInFile);
+            
+            // Step 4: Optional - update the webview if it's open
+            if (graphPanel) {
+                graphPanel.webview.postMessage({
+                    command: 'renderGraph',
+                    nodes: semanticGraph.nodes,
+                    edges: semanticGraph.edges
+                });
+            }
+            
             vscode.window.showInformationMessage('SaralFlow: Graph update complete.');
-        }, 2000); // 2-second debounce
+        }, 4000); // 2-second debounce
     };
 
     // Listen for file changes, creations, and deletions
@@ -1321,8 +1337,7 @@ async function displayLLMResponseAsNewFile(llmResponse: string) {
 }
 
 async function callLLM(prompt: string, apiKey: string): Promise<string> {
-    // This is a simplified example. You'll need to use an actual library like 'openai' or 'ollama'
-    // This function should be in your `embeddingService.ts` or a new `llmService.ts`.
+
 
     // Assuming you're using OpenAI's chat completion API
     const { OpenAI } = require('openai'); // Make sure 'openai' is installed
