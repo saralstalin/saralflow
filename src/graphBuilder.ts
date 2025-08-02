@@ -1,52 +1,44 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import {CodeGraph, INode, IEdge, EdgeType, toNodeKind, generateNodeId, GraphNode, ISemanticGraph  } from './graphTypes';
+import {CodeGraph, INode, IEdge, EdgeType, toNodeKind, generateNodeId,  ISemanticGraph, NodeKind  } from './graphTypes';
 import { getEmbedding } from './embeddingService';
-import { getApiKey } from './extension';
+import { getApiKey, semanticGraph } from './extension';
 
-export async function extractSemanticGraph(): Promise<ISemanticGraph> {
-    const nodes: INode[] = [];
-    const edges: IEdge[] = [];
-    const nodeMap = new Map<string, INode>(); // Map<NodeId, INode> for quick lookup
-    const processedFiles = new Set<string>(); // Set<Filepath> to track files already processed
 
-    // --- API Key and Embedding setup ---
+
+/**
+ * Extracts a complete semantic graph from the workspace, now returning a CodeGraph instance.
+ */
+export async function extractSemanticGraph(): Promise<CodeGraph> {
+    const graph = new CodeGraph(); // Create a new CodeGraph instance
+    const processedFiles = new Set<string>();
     let apiKey: string | undefined;
     try {
-        // Assuming getApiKey fetches the API key from secretStorage
-        apiKey = await getApiKey(); // Ensure getApiKey is defined and accessible
+        apiKey = await getApiKey();
     } catch (e) {
         console.error(`[SaralFlow Graph] Failed to retrieve API Key: ${e}`);
         apiKey = undefined;
     }
     const useEmbeddings = !!apiKey;
-
     if (!useEmbeddings) {
         vscode.window.showWarningMessage('SaralFlow Graph: API Key not set. Node embeddings will not be generated. Semantic similarity search will be limited or unavailable.');
         console.warn('[SaralFlow Graph] API Key not available. Embeddings will not be generated.');
     } else {
         console.log('[SaralFlow Graph] API Key available. Embeddings will be generated.');
     }
-
     if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
         vscode.window.showInformationMessage('No workspace folder open. Cannot build graph.');
         console.error('[SaralFlow Graph] ERROR: No workspace folder open.');
-        return { nodes: [], edges: [] };
+        return graph;
     }
-
     const workspaceFolder = vscode.workspace.workspaceFolders[0].uri;
     console.log(`[SaralFlow Graph] Starting graph extraction for workspace: ${workspaceFolder.fsPath}`);
-
-    // --- Auxiliary Data Structure for Efficient Lookup ---
-    const fileSymbolsMap = new Map<string, INode[]>(); // Key: file URI string, Value: Array of INode (symbols)
-
+    const fileSymbolsMap = new Map<string, INode[]>();
     const findContainingSymbolId = (fileUriStr: string, position: vscode.Position): string | null => {
         const symbolsInFile = fileSymbolsMap.get(fileUriStr);
         if (!symbolsInFile) {
             return null;
         }
-        // Sort by start position for reliable containment checks if not already sorted
-        // (Though your processing loop already ensures this for adding to fileSymbolsMap)
         for (let i = symbolsInFile.length - 1; i >= 0; i--) {
             const symbol = symbolsInFile[i];
             if (!symbol.range) { continue; }
@@ -59,20 +51,15 @@ export async function extractSemanticGraph(): Promise<ISemanticGraph> {
         }
         return null;
     };
-
-    // --- 0. Robust Wait for C# Extension Activation (Simpler Delay Approach) ---
     console.log('[SaralFlow Graph] Ensuring C# extension is active...');
     vscode.window.showInformationMessage('SaralFlow Graph: Activating C# language services...');
-
     const csharpExtensionId = 'ms-dotnettools.csharp';
     const csharpExtension = vscode.extensions.getExtension(csharpExtensionId);
-
     if (!csharpExtension) {
         console.error(`[SaralFlow Graph] ERROR: C# extension "${csharpExtensionId}" not found. Please ensure it is installed.`);
         vscode.window.showErrorMessage(`SaralFlow Graph: C# extension not found. Please install it for C# features.`);
-        return { nodes: [], edges: [] };
+        return graph;
     }
-
     if (!csharpExtension.isActive) {
         console.log(`[SaralFlow Graph] C# extension "${csharpExtensionId}" is not active, activating...`);
         try {
@@ -81,99 +68,73 @@ export async function extractSemanticGraph(): Promise<ISemanticGraph> {
         } catch (e: any) {
             console.error(`[SaralFlow Graph] ERROR activating C# extension: ${e.message}`);
             vscode.window.showErrorMessage(`SaralFlow Graph: Failed to activate C# extension: ${e.message}`);
-            return { nodes: [], edges: [] };
+            return graph;
         }
     } else {
         console.log(`[SaralFlow Graph] C# extension "${csharpExtensionId}" is already active.`);
     }
-
-    // Give the language server a substantial amount of time to load the project's semantic model.
-    const initialLSPWaitTimeMs = 15000; // 15 seconds
+    const initialLSPWaitTimeMs = 15000;
     console.log(`[SaralFlow Graph] Waiting ${initialLSPWaitTimeMs / 1000} seconds for C# language server to initialize...`);
     await new Promise(resolve => setTimeout(resolve, initialLSPWaitTimeMs));
     console.log('[SaralFlow Graph] Initial C# language server wait complete, proceeding with graph build.');
-
-
-    // --- 1. Discover all relevant code files ---
     const files = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,cs,py}', '{**/node_modules/**,**/bin/**,**/obj/**,**/__pycache__/**,**/.venv/**}');
-
     console.log(`[SaralFlow Graph] DEBUG: vscode.workspace.findFiles found ${files.length} files.`);
     if (files.length === 0) {
         vscode.window.showWarningMessage('SaralFlow Graph: No code files found matching the pattern. Check your workspace or glob pattern.');
         console.warn('[SaralFlow Graph] No files found, returning empty graph.');
-        return { nodes: [], edges: [] };
+        return graph;
     }
-
     console.log(`[SaralFlow Graph] Found ${files.length} code files matching pattern.`);
     vscode.window.showInformationMessage(`SaralFlow Graph: Found ${files.length} code files. Processing...`);
-
-
-    // --- 2. Process each file to extract document symbols and build containment graph ---
     for (const fileUri of files) {
         const filePath = fileUri.fsPath;
         const relativePath = vscode.workspace.asRelativePath(fileUri, true);
-
         if (processedFiles.has(filePath)) {
             continue;
         }
         processedFiles.add(filePath);
-
         const fileNodeId = fileUri.toString();
-        if (!nodeMap.has(fileNodeId)) {
+        if (!graph.nodes.has(fileNodeId)) {
             const fileNode: INode = {
                 id: fileNodeId,
                 label: relativePath,
                 kind: 'File',
-                detail: '', // Files don't have LSP detail in this context
+                detail: '',
                 uri: fileNodeId,
-                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, // Placeholder range for file
-                codeSnippet: await vscode.workspace.openTextDocument(fileUri).then(doc => doc.getText()) // Get full file content for file node
+                range: new vscode.Range(0, 0, 0, 0),
+                codeSnippet: await vscode.workspace.openTextDocument(fileUri).then(doc => doc.getText())
             };
-            nodes.push(fileNode);
-            nodeMap.set(fileNodeId, fileNode);
+            graph.addNode(fileNode);
         }
-
         try {
             const document = await vscode.workspace.openTextDocument(fileUri);
             console.log(`[SaralFlow Graph] Processing file: ${relativePath}`);
-
             const documentSymbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
                 'vscode.executeDocumentSymbolProvider',
                 document.uri
             );
-
             console.log(`[SaralFlow Graph] DEBUG: Found ${documentSymbols ? documentSymbols.length : 0} symbols in ${relativePath}`);
-
             if (documentSymbols && documentSymbols.length > 0) {
                 const processSymbol = (symbol: vscode.DocumentSymbol, parentId: string) => {
-                    const symbolUniqueQualifier = `${symbol.name}:${symbol.range.start.line}:${symbol.range.start.character}`;
-                    const symbolId = `${parentId}#${symbolUniqueQualifier}`;
-
-                    if (!nodeMap.has(symbolId)) {
-                        const codeSnippet = document.getText(symbol.range); // Extract the actual code snippet
+                    const symbolId = generateNodeId(fileUri.toString(), symbol);
+                    if (!graph.nodes.has(symbolId)) {
+                        const codeSnippet = document.getText(symbol.range);
                         const symbolNode: INode = {
                             id: symbolId,
                             label: symbol.name,
                             kind: vscode.SymbolKind[symbol.kind],
-                            detail: symbol.detail || '', // Keep LSP detail (can be empty)
+                            detail: symbol.detail || '',
                             uri: fileUri.toString(),
-                            range: {
-                                start: { line: symbol.range.start.line, character: symbol.range.start.character },
-                                end: { line: symbol.range.end.line, character: symbol.range.end.character }
-                            },
+                            range: new vscode.Range(symbol.range.start, symbol.range.end),
                             parentIds: [parentId],
-                            codeSnippet: codeSnippet // Store the code snippet
+                            codeSnippet: codeSnippet
                         };
-                        nodes.push(symbolNode);
-                        nodeMap.set(symbolId, symbolNode);
-
-                        edges.push({
+                        graph.addNode(symbolNode);
+                        graph.addEdge({
                             from: parentId,
                             to: symbolId,
-                            label: 'CONTAINS'
+                            label: EdgeType.CONTAINS
                         });
-
-                        // Add to fileSymbolsMap only if it's not a 'File' node itself
                         if (symbolNode.kind !== 'File' && symbolNode.range) {
                             let symbolsInFile = fileSymbolsMap.get(fileUri.toString());
                             if (!symbolsInFile) {
@@ -183,27 +144,23 @@ export async function extractSemanticGraph(): Promise<ISemanticGraph> {
                             symbolsInFile.push(symbolNode);
                         }
                     }
-
                     if (symbol.children && symbol.children.length > 0) {
                         symbol.children.forEach(childSymbol => {
                             processSymbol(childSymbol, symbolId);
                         });
                     }
                 };
-
                 documentSymbols.forEach(topLevelSymbol => {
                     processSymbol(topLevelSymbol, fileNodeId);
                 });
             } else {
                 console.log(`[SaralFlow Graph] No document symbols found in: ${relativePath}`);
             }
-
         } catch (error: any) {
             console.error(`[SaralFlow Graph] Failed to open or process document ${relativePath}: ${error.message}`);
             vscode.window.showErrorMessage(`SaralFlow Graph: Error processing ${relativePath}: ${error.message}`);
         }
     }
-
     console.log('[SaralFlow Graph] Sorting symbols for quick lookup...');
     fileSymbolsMap.forEach(symbols => {
         symbols.sort((a, b) => {
@@ -212,129 +169,90 @@ export async function extractSemanticGraph(): Promise<ISemanticGraph> {
         });
     });
     console.log('[SaralFlow Graph] Finished sorting symbols.');
-    console.log(`[SaralFlow Graph] DEBUG: After initial file and symbol processing: nodes.length = ${nodes.length}, edges.length = ${edges.length}`);
-
-
-    // --- NEW: Generate and store embeddings for all nodes ---
-    console.log(`[SaralFlow Graph] Generating embeddings for ${nodes.length} nodes...`);
-    vscode.window.showInformationMessage(`SaralFlow Graph: Generating embeddings for ${nodes.length} nodes (this may take a while)...`);
-
+    console.log(`[SaralFlow Graph] DEBUG: After initial file and symbol processing: nodes.length = ${graph.nodes.size}, edges.length = ${graph.edges.length}`);
+    console.log(`[SaralFlow Graph] Generating embeddings for ${graph.nodes.size} nodes...`);
+    vscode.window.showInformationMessage(`SaralFlow Graph: Generating embeddings for ${graph.nodes.size} nodes (this may take a while)...`);
     let embeddedNodesCount = 0;
     const nodesToEmbed: { node: INode; textToEmbed: string }[] = [];
-
-    // First, collect all the nodes that need an embedding and prepare the text
-    for (const node of nodes) {
+    for (const [id, node] of graph.nodes.entries()) {
         if (useEmbeddings && node.codeSnippet) {
-            // Combine relevant text for embedding
             const textToEmbed = `${node.kind}: ${node.label}\n${node.detail || ''}\n${node.codeSnippet}`;
-
-            // Optional: Trim long snippets to avoid hitting token limits
             const maxEmbedTextLength = 8000;
             const truncatedText = textToEmbed.length > maxEmbedTextLength ?
                 textToEmbed.substring(0, maxEmbedTextLength) : textToEmbed;
-
             nodesToEmbed.push({ node, textToEmbed: truncatedText });
         } else if (useEmbeddings && !node.codeSnippet) {
-            // This is a good place for a more verbose log if needed, but let's keep it clean
-            // console.warn(`[SaralFlow Graph] Skipping embedding for node ${node.label} (no code snippet available).`);
         }
     }
-
-    // --- NEW PARALLEL EMBEDDING SECTION ---
-
     if (nodesToEmbed.length > 0) {
         console.log(`[SaralFlow Graph] Starting parallel embedding for ${nodesToEmbed.length} nodes...`);
-
-        // Create an array of Promises for each embedding call
         const embeddingPromises = nodesToEmbed.map(item =>
             getEmbedding(item.textToEmbed, apiKey!)
-                .then(embedding => ({ node: item.node, embedding })) // Attach the original node to the result
+                .then(embedding => ({ node: item.node, embedding }))
                 .catch(error => {
-                    // Log the error for this specific node and return null for the embedding
                     console.error(`[SaralFlow Graph] Error embedding node ${item.node.label}: ${error.message}`);
                     return { node: item.node, embedding: null };
                 })
         );
-
-        // Wait for all promises to resolve in parallel
         const embeddingResults = await Promise.all(embeddingPromises);
-
-        // Now, iterate through the results and update the nodes
         for (const result of embeddingResults) {
             if (result.embedding) {
                 result.node.embedding = result.embedding;
                 embeddedNodesCount++;
             }
         }
-        
         console.log(`[SaralFlow Graph] Finished embedding. Successfully embedded ${embeddedNodesCount} nodes.`);
     } else {
-    console.log('[SaralFlow Graph] No nodes found to embed or embeddings were disabled.');
+        console.log('[SaralFlow Graph] No nodes found to embed or embeddings were disabled.');
     }
     console.log(`[SaralFlow Graph] Finished generating node embeddings. Successfully embedded ${embeddedNodesCount} nodes.`);
-    
     vscode.window.showInformationMessage(`SaralFlow Graph: Generated embeddings for ${embeddedNodesCount} nodes.`);
-
-
-    // --- 3. Build Interdependencies: REFERENCES (LSP with Fallback) ---
     console.log('[SaralFlow Graph] Building interdependencies (References)...');
     vscode.window.showInformationMessage('SaralFlow Graph: Building interdependencies (References)...');
-
     let referenceEdgesCount = 0;
-
-    for (const [symbolNodeId, symbolNode] of nodeMap.entries()) {
+    for (const [symbolNodeId, symbolNode] of graph.nodes.entries()) {
         if (symbolNode.kind === 'File' || !symbolNode.uri || !symbolNode.range) {
             continue;
         }
-
         let references: vscode.Location[] | null | undefined = null;
         let successViaLSPReferences = false;
-
-        // Try LSP for References
         try {
             const definitionUri = vscode.Uri.parse(symbolNode.uri);
             const definitionPosition = new vscode.Position(symbolNode.range.start.line, symbolNode.range.start.character);
-
             console.log(`[SaralFlow Graph] DEBUG: Querying references via LSP for: ${symbolNode.label} (Kind: ${symbolNode.kind}) at URI: ${symbolNode.uri}, Position: ${definitionPosition.line}:${definitionPosition.character}`);
-
             references = await vscode.commands.executeCommand<vscode.Location[]>(
                 'vscode.executeReferenceProvider',
                 definitionUri,
                 definitionPosition
             );
-
             console.log(`[SaralFlow Graph] DEBUG: executeReferenceProvider for "${symbolNode.label}" returned: ${references ? references.length + ' references' : 'null/undefined'}.`);
-
             if (references && references.length > 0) {
                 successViaLSPReferences = true;
                 references.forEach(referenceLocation => {
                     const refFileUriStr = referenceLocation.uri.toString();
-
                     if (refFileUriStr === symbolNode.uri && referenceLocation.range.start.isEqual(definitionPosition)) {
-                        return; // Skip self-reference
+                        return;
                     }
                     if (!processedFiles.has(referenceLocation.uri.fsPath)) {
                         console.log(`[SaralFlow Graph] DEBUG: Skipping external reference to "${symbolNode.label}" in ${referenceLocation.uri.fsPath}`);
-                        return; // Skip references outside our processed files
+                        return;
                     }
-
                     const fromNodeId = findContainingSymbolId(refFileUriStr, referenceLocation.range.start);
-
-                    if (fromNodeId && nodeMap.has(fromNodeId) && fromNodeId !== symbolNodeId) {
-                        const isDuplicateEdge = edges.some(e => e.from === fromNodeId && e.to === symbolNodeId && e.label === 'REFERENCES');
+                    if (fromNodeId && graph.nodes.has(fromNodeId) && fromNodeId !== symbolNodeId) {
+                        const isDuplicateEdge = graph.edges.some(e => e.from === fromNodeId && e.to === symbolNodeId && e.label === EdgeType.REFERENCES);
                         if (!isDuplicateEdge) {
-                            edges.push({ from: fromNodeId, to: symbolNodeId, label: 'REFERENCES' });
+                            graph.addEdge({ from: fromNodeId, to: symbolNodeId, label: EdgeType.REFERENCES });
                             referenceEdgesCount++;
-                            console.log(`[SaralFlow Graph] DEBUG: Added REFERENCES edge (LSP) from ${nodeMap.get(fromNodeId)?.label} to ${symbolNode.label}`);
+                            console.log(`[SaralFlow Graph] DEBUG: Added REFERENCES edge (LSP) from ${graph.nodes.get(fromNodeId)?.label} to ${symbolNode.label}`);
                         }
                     } else if (fromNodeId === null) {
                         const fileContainingRefId = referenceLocation.uri.toString();
-                        if (nodeMap.has(fileContainingRefId) && fileContainingRefId !== symbolNodeId) {
-                            const isDuplicateEdge = edges.some(e => e.from === fileContainingRefId && e.to === symbolNodeId && e.label === 'REFERENCES');
+                        if (graph.nodes.has(fileContainingRefId) && fileContainingRefId !== symbolNodeId) {
+                            const isDuplicateEdge = graph.edges.some(e => e.from === fileContainingRefId && e.to === symbolNodeId && e.label === EdgeType.REFERENCES);
                             if (!isDuplicateEdge) {
-                                edges.push({ from: fileContainingRefId, to: symbolNodeId, label: 'REFERENCES' });
+                                graph.addEdge({ from: fileContainingRefId, to: symbolNodeId, label: EdgeType.REFERENCES });
                                 referenceEdgesCount++;
-                                console.log(`[SaralFlow Graph] DEBUG: Added REFERENCES edge (LSP) from file ${nodeMap.get(fileContainingRefId)?.label} to ${symbolNode.label}`);
+                                console.log(`[SaralFlow Graph] DEBUG: Added REFERENCES edge (LSP) from file ${graph.nodes.get(fileContainingRefId)?.label} to ${symbolNode.label}`);
                             }
                         }
                     } else {
@@ -347,48 +265,25 @@ export async function extractSemanticGraph(): Promise<ISemanticGraph> {
         } catch (error: any) {
             console.error(`[SaralFlow Graph] ERROR: LSP Reference lookup failed for ${symbolNode.label} (${symbolNode.uri}): ${error.message}. Attempting fallback.`);
         }
-
-        // --- Fallback for REFERENCES (Simple text search - less accurate) ---
-        if (!successViaLSPReferences && symbolNode.kind !== 'File' && symbolNode.label) { // Only fallback for non-file nodes
+        if (!successViaLSPReferences && symbolNode.kind !== 'File' && symbolNode.label) {
             try {
-                const symbolNameRegex = new RegExp(`\\b${symbolNode.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'); // Escape regex special chars
-
+                const symbolNameRegex = new RegExp(`\\b${symbolNode.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
                 for (const fileToCheckUri of files) {
                     const fileToCheckPath = fileToCheckUri.fsPath;
-                    if (fileToCheckPath === symbolNode.uri) {continue;} // Don't check the file defining the symbol
-
-                    if (!processedFiles.has(fileToCheckPath)) {continue;} // Only check files we actually processed
-
+                    if (fileToCheckPath === symbolNode.uri) { continue; }
+                    if (!processedFiles.has(fileToCheckPath)) { continue; }
                     const documentToCheck = await vscode.workspace.openTextDocument(fileToCheckUri);
                     const fileContent = documentToCheck.getText();
-
                     let match;
                     while ((match = symbolNameRegex.exec(fileContent)) !== null) {
                         const startPosition = documentToCheck.positionAt(match.index);
-                        const endPosition = documentToCheck.positionAt(match.index + match[0].length);
-                        const referenceRange = new vscode.Range(startPosition, endPosition);
-
-                        const fromNodeId = findContainingSymbolId(fileToCheckUri.toString(), referenceRange.start);
-
-                        if (fromNodeId && nodeMap.has(fromNodeId) && fromNodeId !== symbolNodeId) {
-                            const isDuplicateEdge = edges.some(e => e.from === fromNodeId && e.to === symbolNodeId && e.label === 'REFERENCES');
+                        const fromNodeId = findContainingSymbolId(fileToCheckUri.toString(), startPosition);
+                        if (fromNodeId && graph.nodes.has(fromNodeId) && fromNodeId !== symbolNodeId) {
+                            const isDuplicateEdge = graph.edges.some(e => e.from === fromNodeId && e.to === symbolNodeId && e.label === EdgeType.REFERENCES);
                             if (!isDuplicateEdge) {
-                                edges.push({ from: fromNodeId, to: symbolNodeId, label: 'REFERENCES' });
+                                graph.addEdge({ from: fromNodeId, to: symbolNodeId, label: EdgeType.REFERENCES });
                                 referenceEdgesCount++;
-                                console.log(`[SaralFlow Graph] DEBUG: Added REFERENCES edge (Fallback) from ${nodeMap.get(fromNodeId)?.label} to ${symbolNode.label} in ${vscode.workspace.asRelativePath(fileToCheckUri)}`);
                             }
-                        } else if (fromNodeId === null) {
-                            const fileContainingRefId = fileToCheckUri.toString();
-                            if (nodeMap.has(fileContainingRefId) && fileContainingRefId !== symbolNodeId) {
-                                const isDuplicateEdge = edges.some(e => e.from === fileContainingRefId && e.to === symbolNodeId && e.label === 'REFERENCES');
-                                if (!isDuplicateEdge) {
-                                    edges.push({ from: fileContainingRefId, to: symbolNodeId, label: 'REFERENCES' });
-                                    referenceEdgesCount++;
-                                    console.log(`[SaralFlow Graph] DEBUG: Added REFERENCES edge (Fallback) from file ${nodeMap.get(fileContainingRefId)?.label} to ${symbolNode.label} in ${vscode.workspace.asRelativePath(fileToCheckUri)}`);
-                                }
-                            }
-                        } else {
-                            console.log(`[SaralFlow Graph] DEBUG: Fallback Ref to ${symbolNode.label} from ${vscode.workspace.asRelativePath(fileToCheckUri)} not added (fromNodeId is self or not in nodeMap: ${fromNodeId})`);
                         }
                     }
                 }
@@ -397,220 +292,95 @@ export async function extractSemanticGraph(): Promise<ISemanticGraph> {
             }
         }
     }
-    console.log(`[SaralFlow Graph] Finished building references. Added ${referenceEdgesCount} reference edges. Current total edges: ${edges.length}`);
-
-
-    // --- 4. Build Interdependencies: INHERITANCE (LSP with C#-specific Regex Fallback) ---
+    console.log(`[SaralFlow Graph] Finished building references. Added ${referenceEdgesCount} reference edges. Current total edges: ${graph.edges.length}`);
     console.log('[SaralFlow Graph] Building interdependencies (Inheritance)...');
     vscode.window.showInformationMessage('SaralFlow Graph: Building inheritance relationships...');
-
     let inheritanceEdgesCount = 0;
-
-    for (const [symbolNodeId, symbolNode] of nodeMap.entries()) {
-        if ((symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Class] ||
-            symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Interface]) &&
-            symbolNode.uri && symbolNode.range) {
+    for (const [symbolNodeId, symbolNode] of graph.nodes.entries()) {
+        if ((symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Class] || symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Interface]) && symbolNode.uri && symbolNode.range) {
             const classUri = vscode.Uri.parse(symbolNode.uri);
             const classPosition = new vscode.Position(symbolNode.range.start.line, symbolNode.range.start.character);
-
             let supertypes: vscode.TypeHierarchyItem[] | null | undefined = null;
             let successViaLSP = false;
-
-            // Try LSP for Inheritance first
             try {
                 console.log(`[SaralFlow Graph] DEBUG: Querying Type Hierarchy via LSP for: ${symbolNode.label} (Kind: ${symbolNode.kind}) at URI: ${symbolNode.uri}, Position: ${symbolNode.range.start.line}:${symbolNode.range.start.character}`);
-
                 const typeHierarchyItems = await vscode.commands.executeCommand<vscode.TypeHierarchyItem[]>(
                     'vscode.prepareTypeHierarchy',
                     classUri,
                     classPosition
                 );
                 console.log(`[SaralFlow Graph] DEBUG: prepareTypeHierarchy for "${symbolNode.label}" returned: ${typeHierarchyItems ? typeHierarchyItems.length + ' items' : 'null/undefined'}.`);
-
-
                 if (typeHierarchyItems && typeHierarchyItems.length > 0) {
                     const classHierarchyItem = typeHierarchyItems[0];
                     console.log(`[SaralFlow Graph] DEBUG: prepareTypeHierarchy successful for ${symbolNode.label}. Resolving supertypes...`);
-
                     supertypes = await vscode.commands.executeCommand<vscode.TypeHierarchyItem[]>(
                         'vscode.executeTypeHierarchySupertypes',
                         classHierarchyItem
                     );
-
                     console.log(`[SaralFlow Graph] DEBUG: executeTypeHierarchySupertypes for "${symbolNode.label}" returned: ${supertypes ? supertypes.length + ' supertypes' : 'null/undefined'}.`);
-
-
                     if (supertypes && supertypes.length > 0) {
                         successViaLSP = true;
                         supertypes.forEach(supertypeItem => {
                             const supertypeUri = supertypeItem.uri.toString();
-                            const supertypeSymbolId = findContainingSymbolId(supertypeUri, supertypeItem.selectionRange.start);
-
-                            if (supertypeSymbolId && nodeMap.has(supertypeSymbolId) && supertypeSymbolId !== symbolNodeId) {
-                                const isDuplicateEdge = edges.some(e => e.from === symbolNodeId && e.to === supertypeSymbolId && e.label === 'INHERITS');
+                            const supertypeId = generateNodeId(supertypeUri, supertypeItem);
+                            if (graph.nodes.has(supertypeId)) {
+                                const isDuplicateEdge = graph.edges.some(e => e.from === symbolNodeId && e.to === supertypeId && e.label === EdgeType.INHERITS_FROM);
                                 if (!isDuplicateEdge) {
-                                    edges.push({
-                                        from: symbolNodeId,
-                                        to: supertypeSymbolId,
-                                        label: 'INHERITS'
-                                    });
+                                    graph.addEdge({ from: symbolNodeId, to: supertypeId, label: EdgeType.INHERITS_FROM });
                                     inheritanceEdgesCount++;
-                                    console.log(`[SaralFlow Graph] DEBUG: Added INHERITS edge via LSP from ${symbolNode.label} to ${nodeMap.get(supertypeSymbolId)?.label}`);
+                                    console.log(`[SaralFlow Graph] DEBUG: Added INHERITS_FROM edge (LSP) from ${graph.nodes.get(symbolNodeId)?.label} to ${supertypeItem.name}`);
                                 }
-                            } else {
-                                console.log(`[SaralFlow Graph] DEBUG: LSP Supertype node for "${symbolNode.label}" not found in nodeMap or is self: ${supertypeSymbolId}`);
                             }
                         });
-                    } else if (supertypes === null || supertypes === undefined || supertypes.length === 0) {
-                        console.log(`[SaralFlow Graph] DEBUG: LSP executeTypeHierarchySupertypes returned empty/null/undefined for "${symbolNode.label}".`);
                     }
-                } else if (typeHierarchyItems === null || typeHierarchyItems === undefined || typeHierarchyItems.length === 0) {
-                    console.log(`[SaralFlow Graph] DEBUG: LSP prepareTypeHierarchy returned empty/null/undefined for "${symbolNode.label}".`);
                 }
             } catch (error: any) {
-                console.error(`[SaralFlow Graph] ERROR: LSP Type Hierarchy lookup failed for ${symbolNode.label} (${symbolNode.uri}): ${error.message}. Attempting fallback.`);
-            }
-
-            // --- Fallback for INHERITANCE (C#-specific Regex) ---
-            if (!successViaLSP) { // This condition checks if LSP was NOT successful
-                try {
-                    const document = await vscode.workspace.openTextDocument(classUri);
-                    const classTextLine = document.lineAt(classPosition.line).text;
-                    // Regex for C# inheritance: looks for 'class ClassName : BaseType'
-                    const inheritanceRegex = /(?:class|interface)\s+([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_,.\s<>]+)/;
-                    const match = classTextLine.match(inheritanceRegex);
-
-                    if (match && match[1] === symbolNode.label && match[2]) {
-                        const baseTypesRaw = match[2];
-                        const baseTypeNames = baseTypesRaw.split(',').map(name => name.trim().replace(/<.*>/g, ''));
-
-                        for (const baseTypeName of baseTypeNames) {
-                            // Find the base type node by label and a 'Class' kind (heuristic)
-                            const baseTypeNode = nodes.find(n => n.label === baseTypeName && n.kind === vscode.SymbolKind[vscode.SymbolKind.Class]);
-                            if (baseTypeNode && baseTypeNode.id !== symbolNodeId) {
-                                const isDuplicateEdge = edges.some(e => e.from === symbolNodeId && e.to === baseTypeNode.id && e.label === 'INHERITS');
-                                if (!isDuplicateEdge) {
-                                    edges.push({
-                                        from: symbolNodeId,
-                                        to: baseTypeNode.id,
-                                        label: 'INHERITS'
-                                    });
-                                    inheritanceEdgesCount++;
-                                    console.log(`[SaralFlow Graph] DEBUG: Added INHERITS edge via fallback from ${symbolNode.label} to ${baseTypeNode.label}`);
-                                }
-                            } else {
-                                console.log(`[SaralFlow Graph] DEBUG: Fallback: Base type "${baseTypeName}" node not found in graph for ${symbolNode.label}`);
-                            }
-                        }
-                    }
-                } catch (error: any) {
-                    console.error(`[SaralFlow Graph] ERROR: Fallback inheritance parsing failed for ${symbolNode.label}: ${error.message}`);
-                }
+                console.error(`[SaralFlow Graph] ERROR: LSP Type Hierarchy lookup failed for ${symbolNode.label}: ${error.message}`);
             }
         }
     }
-    console.log(`[SaralFlow Graph] Finished building inheritance. Added ${inheritanceEdgesCount} inheritance edges. Current total edges: ${edges.length}`);
+    console.log(`[SaralFlow Graph] Finished building inheritance. Added ${inheritanceEdgesCount} inheritance edges.`);
+    
+    // --- New: Call Hierarchy Section ---
+    console.log('[SaralFlow Graph] Building call hierarchy...');
+    vscode.window.showInformationMessage('SaralFlow Graph: Building call hierarchy relationships...');
+    let callHierarchyEdgesCount = 0;
+    
+    // Create a list of promises for concurrent execution
+    const callHierarchyPromises = [];
+    const allNodes = Array.from(graph.nodes.values());
 
-
-    // --- (Optional: Step 5 - Build Call Hierarchy - Uncomment and use if needed) ---
-    /*
-    console.log('[SaralFlow Graph] Building Call Hierarchy (if supported)...');
-    let callEdgesCount = 0;
-    for (const [symbolNodeId, symbolNode] of nodeMap.entries()) {
-        if ((symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Method] || symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Function] || symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Constructor]) &&
-            symbolNode.uri && symbolNode.range) {
-            let successViaLSPCalls = false;
-            // Removed provider check here, as it was causing compilation errors.
-            // LSP calls will now always be attempted for these symbols after initial delay.
-            try {
-                const callableUri = vscode.Uri.parse(symbolNode.uri);
-                const callablePosition = new vscode.Position(symbolNode.range.start.line, symbolNode.range.start.character);
-
-                console.log(`[SaralFlow Graph] DEBUG: Querying Call Hierarchy via LSP for: ${symbolNode.label} (Kind: ${symbolNode.kind})`);
-
-                const callHierarchyItems = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>(
-                    'vscode.prepareCallHierarchy',
-                    callableUri,
-                    callablePosition
-                );
-                console.log(`[SaralFlow Graph] DEBUG: prepareCallHierarchy for "${symbolNode.label}" returned: ${callHierarchyItems ? callHierarchyItems.length + ' items' : 'null/undefined'}.`);
-
-                if (callHierarchyItems && callHierarchyItems.length > 0) {
-                    const callItem = callHierarchyItems[0];
-                    console.log(`[SaralFlow Graph] DEBUG: prepareCallHierarchy successful for ${symbolNode.label}. Resolving outgoing calls...`);
-
-                    const outgoingCalls = await vscode.commands.executeCommand<vscode.CallHierarchyOutgoingCall[]>(
-                        'vscode.executeCallHierarchyOutgoingCalls',
-                        callItem
-                    );
-                    console.log(`[SaralFlow Graph] DEBUG: executeCallHierarchyOutgoingCalls for "${symbolNode.label}" returned: ${outgoingCalls ? outgoingCalls.length + ' calls' : 'null/undefined'}.`);
-
-                    if (outgoingCalls && outgoingCalls.length > 0) {
-                        successViaLSPCalls = true;
-                        outgoingCalls.forEach(call => {
-                            const calleeUri = call.to.uri.toString();
-                            const calleeSymbolId = findContainingSymbolId(calleeUri, call.to.selectionRange.start);
-                            if (calleeSymbolId && nodeMap.has(calleeSymbolId) && calleeSymbolId !== symbolNodeId) {
-                                const isDuplicateEdge = edges.some(e => e.from === symbolNodeId && e.to === calleeSymbolId && e.label === 'CALLS');
-                                if (!isDuplicateEdge) {
-                                    edges.push({
-                                        from: symbolNodeId,
-                                        to: calleeSymbolId,
-                                        label: 'CALLS'
-                                    });
-                                    callEdgesCount++;
-                                    console.log(`[SaralFlow Graph] DEBUG: Added CALLS edge (LSP) from ${nodeMap.get(calleeSymbolId)?.label} to ${symbolNode.label}`);
-                                }
-                            } else {
-                                console.log(`[SaralFlow Graph] DEBUG: LSP Callee node for "${symbolNode.label}" not found/self: ${calleeSymbolId}`);
-                            }
-                        });
-                    } else if (outgoingCalls === null || outgoingCalls === undefined || outgoingCalls.length === 0) {
-                        console.log(`[SaralFlow Graph] DEBUG: LSP executeCallHierarchyOutgoingCalls returned empty/null/undefined for "${symbolNode.label}".`);
-                    }
-                } else if (callHierarchyItems === null || callHierarchyItems === undefined || callHierarchyItems.length === 0) {
-                    console.log(`[SaralFlow Graph] DEBUG: LSP prepareCallHierarchy returned empty/null/undefined for "${symbolNode.label}".`);
-                }
-            } catch (e: any) {
-                console.error(`[SaralFlow Graph] ERROR: LSP Call Hierarchy lookup failed for ${symbolNode.label} (${symbolNode.uri}): ${e.message}. Attempting fallback.`);
-            }
-
-            // --- Fallback for CALLS (basic regex/text search for function calls) ---
-            // This would be highly heuristic and error-prone.
-            // Only implement if LSP Call Hierarchy consistently fails AND you absolutely need some calls.
-            // if (!successViaLSPCalls && symbolNode.kind !== 'File') {
-            //     try {
-            //         const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(symbolNode.uri));
-            //         const fileContent = document.getText();
-            //         // This is a VERY simple regex. Real call parsing is complex.
-            //         // It looks for symbolNode.label() or symbolNode.label.
-            //         const callRegex = new RegExp(`\\b${symbolNode.label}\\s*\\(`, 'g');
-            //         let match;
-            //         while ((match = callRegex.exec(fileContent)) !== null) {
-            //             const startPosition = document.positionAt(match.index);
-            //             const fromNodeId = findContainingSymbolId(symbolNode.uri, startPosition);
-            //             if (fromNodeId && nodeMap.has(fromNodeId) && fromNodeId !== symbolNodeId) {
-            //                 const isDuplicateEdge = edges.some(e => e.from === fromNodeId && e.to === symbolNodeId && e.label === 'CALLS');
-            //                 if (!isDuplicateEdge) {
-            //                     edges.push({ from: fromNodeId, to: symbolNodeId, label: 'CALLS' });
-            //                     callEdgesCount++;
-            //                     console.log(`[SaralFlow Graph] DEBUG: Added CALLS edge (Fallback) from ${nodeMap.get(fromNodeId)?.label} to ${symbolNode.label}`);
-            //                 }
-            //             }
-            //         }
-            //     } catch (error: any) {
-            //         console.error(`[SaralFlow Graph] ERROR: Fallback Call parsing failed for ${symbolNode.label}: ${error.message}`);
-            //     }
-            // }
+    for (const node of allNodes) {
+        // Skip file nodes and nodes without a range (these cannot be part of a call hierarchy)
+        if (node.kind === 'File' || !node.range) {
+            continue;
         }
+
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(node.uri));
+        
+        callHierarchyPromises.push(
+            fetchAndProcessCallHierarchy(document, node, graph)
+                .then(() => {
+                    // This function already handles adding nodes and edges, so we just track success.
+                    callHierarchyEdgesCount++;
+                })
+                .catch(error => {
+                    console.error(`[SaralFlow Graph] Failed to fetch call hierarchy for ${node.label}:`, error);
+                })
+        );
     }
-    console.log(`[SaralFlow Graph] Finished building call hierarchy. Added ${callEdgesCount} call edges. Current total edges: ${edges.length}`);
-    */
+    
+    await Promise.all(callHierarchyPromises);
+    
+    console.log(`[SaralFlow Graph] Finished building call hierarchy. Added call hierarchy edges.`);
+    // --- End New Section ---
 
-
-    console.log(`[SaralFlow Graph] Graph construction complete. Final nodes: ${nodes.length}, final edges: ${edges.length}`);
-    return { nodes, edges };
+    console.log(`[SaralFlow Graph] Graph extraction complete. Total nodes: ${graph.nodes.size}, Total edges: ${graph.edges.length}.`);
+    vscode.window.showInformationMessage(`SaralFlow Graph: Graph built successfully! Total nodes: ${graph.nodes.size}, Total edges: ${graph.edges.length}.`);
+    return graph;
 }
+
+
 
 export async function processDocumentSymbols(
     document: vscode.TextDocument,
@@ -619,7 +389,7 @@ export async function processDocumentSymbols(
     parentNodeId: string
 ) {
     for (const symbol of symbols) {
-        const nodeId = generateNodeId(document.uri, symbol); // This line is fine because SimpleSymbolInfo only needs 'name' and 'kind'
+        const nodeId = generateNodeId(document.uri.toString(), symbol); // This line is fine because SimpleSymbolInfo only needs 'name' and 'kind'
 
         // --- Determine the correct range and URI ---
         let symbolRange: vscode.Range;
@@ -639,15 +409,15 @@ export async function processDocumentSymbols(
             id: nodeId,
             label: symbol.name,
             kind: nodeKind,
-            uri: symbolUri, // <-- Use the determined URI
+            uri: symbolUri.toString(), // <-- Use the determined URI
             range: symbolRange, // <-- Use the determined range
             detail: 'detail' in symbol ? symbol.detail : undefined
         });
 
         graph.addEdge({
-            sourceId: parentNodeId,
-            targetId: nodeId,
-            type: EdgeType.CONTAINS
+            from: parentNodeId,
+            to: nodeId,
+            label: EdgeType.CONTAINS
         });
 
         // If it's a DocumentSymbol and has children, recurse
@@ -658,67 +428,194 @@ export async function processDocumentSymbols(
     }
 }
 
-export async function fetchAndProcessCallHierarchy(document: vscode.TextDocument, node: GraphNode, graph: CodeGraph) {
+/**
+ * Fetches and processes the call hierarchy for a given node, adding call-related edges to the graph.
+ * @param document The TextDocument containing the symbol.
+ * @param node The INode representing the symbol to check.
+ * @param graph The CodeGraph instance to add edges to.
+ */
+export async function fetchAndProcessCallHierarchy(document: vscode.TextDocument, node: INode, graph: CodeGraph) {
+    if (!node.range) {
+        return;
+    }
+
     try {
-        const callHierarchyItems: vscode.CallHierarchyItem[] | undefined = await vscode.commands.executeCommand(
+        const prepareResult = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>(
             'vscode.executeCallHierarchyPrepare',
-            node.uri,
+            document.uri,
             node.range.start
         );
 
-        if (!callHierarchyItems || callHierarchyItems.length === 0) {
-            return;
+        if (prepareResult && prepareResult.length > 0) {
+            for (const item of prepareResult) {
+                const incomingCalls = await vscode.commands.executeCommand<vscode.CallHierarchyIncomingCall[]>(
+                    'vscode.executeCallHierarchyIncomingCalls',
+                    item
+                );
+                
+                if (incomingCalls) {
+                    incomingCalls.forEach(call => {
+                        call.fromRanges.forEach(range => {
+                            const callerUri = call.from.uri.toString();
+                            
+                            // Corrected: Create a CallHierarchyItem-compatible object
+                            const callerItem = {
+                                name: call.from.name,
+                                kind: call.from.kind,
+                                tags: call.from.tags,
+                                detail: call.from.detail,
+                                uri: call.from.uri,
+                                range: call.from.range,
+                                selectionRange: call.from.selectionRange
+                            };
+
+                            const callerId = generateNodeId(callerUri, callerItem);
+                            
+                            // Check if the caller node exists in the graph
+                            if (graph.nodes.has(callerId)) {
+                                graph.addEdge({ from: callerId, to: node.id, label: EdgeType.CALLS });
+                            }
+                        });
+                    });
+                }
+                
+                const outgoingCalls = await vscode.commands.executeCommand<vscode.CallHierarchyOutgoingCall[]>(
+                    'vscode.executeCallHierarchyOutgoingCalls',
+                    item
+                );
+                
+                if (outgoingCalls) {
+                    outgoingCalls.forEach(call => {
+                        const calleeUri = call.to.uri.toString();
+                        
+                        // Corrected: The 'call.to' object is already a CallHierarchyItem
+                        const calleeId = generateNodeId(calleeUri, call.to);
+                        
+                        // Check if the callee node exists in the graph
+                        if (graph.nodes.has(calleeId)) {
+                            graph.addEdge({ from: node.id, to: calleeId, label: EdgeType.CALLS });
+                        }
+                    });
+                }
+            }
         }
-
-        const callHierarchyItem = callHierarchyItems[0];
-
-        const outgoingCalls: vscode.CallHierarchyOutgoingCall[] = await vscode.commands.executeCommand(
-            'vscode.executeCallHierarchyOutgoingCalls',
-            callHierarchyItem
-        );
-
-        for (const outgoingCall of outgoingCalls) {
-            const targetNodeId = generateNodeId(outgoingCall.to.uri, outgoingCall.to);
-            graph.addNode({
-                id: targetNodeId,
-                label: outgoingCall.to.name,
-                kind: toNodeKind(outgoingCall.to.kind),
-                uri: outgoingCall.to.uri,
-                range: outgoingCall.to.range,
-                detail: outgoingCall.to.detail
-            });
-
-            graph.addEdge({
-                sourceId: node.id,
-                targetId: targetNodeId,
-                type: EdgeType.CALLS
-            });
-        }
-
-        const incomingCalls: vscode.CallHierarchyIncomingCall[] = await vscode.commands.executeCommand(
-            'vscode.executeCallHierarchyIncomingCalls',
-            callHierarchyItem
-        );
-
-        for (const incomingCall of incomingCalls) {
-            const sourceNodeId = generateNodeId(incomingCall.from.uri, incomingCall.from);
-            graph.addNode({
-                id: sourceNodeId,
-                label: incomingCall.from.name,
-                kind: toNodeKind(incomingCall.from.kind),
-                uri: incomingCall.from.uri,
-                range: incomingCall.from.range,
-                detail: incomingCall.from.detail
-            });
-
-            graph.addEdge({
-                sourceId: sourceNodeId,
-                targetId: node.id,
-                type: EdgeType.CALLED_BY
-            });
-        }
-
     } catch (error) {
-        console.warn(`Could not fetch call hierarchy for ${node.label}:`, error);
+        console.warn(`[SaralFlow Graph] Could not fetch call hierarchy for "${node.label}" (URI: ${node.uri}). This may be due to a language server limitation or an incomplete index. Error:`, error);
+        // Continue without throwing an error
     }
 }
+
+/**
+ * Processes a single file and adds its nodes and edges to the global semanticGraph.
+ * This function should be called when a new file is created or a changed file needs to be re-parsed.
+ * @param fileUri The URI of the file to process.
+ */
+export async function processFileAndAddToGraph(fileUri: vscode.Uri) {
+    console.log(`[SaralFlow Graph] Processing new or changed file: ${fileUri.fsPath}`);
+    try {
+        const document = await vscode.workspace.openTextDocument(fileUri);
+        const fileUriString = fileUri.toString();
+        const fileNodeId = fileUriString;
+
+        const newNodes: INode[] = [];
+        const newEdges: IEdge[] = [];
+        const fileSymbolsMap = new Map<string, INode[]>();
+
+        // Create the file node
+        const fileNode: INode = {
+            id: fileNodeId,
+            label: vscode.workspace.asRelativePath(fileUri, true),
+            kind: 'File',
+            detail: '',
+            uri: fileUriString,
+            range: new vscode.Range(0, 0, 0, 0),
+            codeSnippet: document.getText()
+        };
+        newNodes.push(fileNode);
+
+        const documentSymbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+            'vscode.executeDocumentSymbolProvider',
+            document.uri
+        );
+
+        if (documentSymbols && documentSymbols.length > 0) {
+            const processSymbol = (symbol: vscode.DocumentSymbol, parentId: string) => {
+                const symbolId = generateNodeId(fileUriString, symbol);
+                const codeSnippet = document.getText(symbol.range);
+                const symbolNode: INode = {
+                    id: symbolId,
+                    label: symbol.name,
+                    kind: vscode.SymbolKind[symbol.kind],
+                    detail: symbol.detail || '',
+                    uri: fileUriString,
+                    range: new vscode.Range(symbol.range.start, symbol.range.end),
+                    parentIds: [parentId],
+                    codeSnippet: codeSnippet
+                };
+                newNodes.push(symbolNode);
+                newEdges.push({
+                    from: parentId,
+                    to: symbolId,
+                    label: EdgeType.CONTAINS
+                });
+                
+                if (symbol.children && symbol.children.length > 0) {
+                    symbol.children.forEach(childSymbol => {
+                        processSymbol(childSymbol, symbolId);
+                    });
+                }
+            };
+
+            documentSymbols.forEach(topLevelSymbol => {
+                processSymbol(topLevelSymbol, fileNodeId);
+            });
+        }
+        
+        newNodes.forEach(node => {
+            semanticGraph.nodes.set(node.id, node);
+        });
+
+        semanticGraph.edges = semanticGraph.edges.concat(newEdges);
+        
+        // Re-run call hierarchy for all relevant nodes
+        for (const node of newNodes) {
+             await fetchAndProcessCallHierarchy(document, node, semanticGraph);
+        }
+
+        console.log(`[SaralFlow Graph] Finished processing and adding nodes/edges for: ${fileUri.fsPath}`);
+    } catch (error: any) {
+        console.error(`[SaralFlow Graph] Error processing file ${fileUri.fsPath}:`, error);
+    }
+}
+
+/**
+ * Removes all nodes and edges associated with a given file URI from the graph.
+ * This function should be called when a file is deleted or changed.
+ * @param fileUri The URI of the file to remove.
+ */
+export function removeFileNodesFromGraph(fileUri: vscode.Uri) {
+    console.log(`[SaralFlow Graph] Removing nodes/edges for deleted or changed file: ${fileUri.fsPath}`);
+    const fileUriString = fileUri.toString();
+    const removedNodeIds = new Set<string>();
+
+    // Collect all node IDs to be removed and delete them from the Map
+    for (const [key, node] of semanticGraph.nodes.entries()) {
+        if (node.uri === fileUriString) {
+            removedNodeIds.add(key);
+            semanticGraph.nodes.delete(key);
+        }
+    }
+
+    // Filter out all edges that either start or end at a removed node
+    semanticGraph.edges = semanticGraph.edges.filter(edge =>
+        !removedNodeIds.has(edge.from) && !removedNodeIds.has(edge.to)
+    );
+
+    console.log(`[SaralFlow Graph] Finished removing nodes/edges for: ${fileUri.fsPath}`);
+}
+
+
+
+
+
+

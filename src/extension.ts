@@ -1,18 +1,18 @@
 // src/extension.ts
 import * as vscode from 'vscode';
 import * as path from 'path'; // Import the 'path' module
-import { CodeGraph, GraphNode, GraphEdge, INode, IEdge, NodeKind, EdgeType, generateNodeId, toNodeKind } from './graphTypes'; 
-import { getEmbedding, cosineSimilarity } from'./embeddingService';
 import fetch from 'node-fetch';
-const DiffMatchPatch: any = require('diff-match-patch'); 
 import pLimit from 'p-limit';
 
+import { CodeGraph,  INode, IEdge } from './graphTypes'; 
+import { getEmbedding, cosineSimilarity } from'./embeddingService';
+import {extractSemanticGraph, processDocumentSymbols, fetchAndProcessCallHierarchy, processFileAndAddToGraph, removeFileNodesFromGraph} from './graphBuilder';
+
+
+const DiffMatchPatch: any = require('diff-match-patch'); 
 // Keep track of the last parsed changes to apply them
 let lastProposedChanges: ProposedFileChange[] = [];
 const limit = pLimit(10);
-
-import {extractSemanticGraph, processDocumentSymbols, fetchAndProcessCallHierarchy} from './graphBuilder';
-
 let currentGraph: CodeGraph = new CodeGraph(); // Our in-memory graph instance
 // Declare panel globally so it can be reused or disposed
 let graphPanel: vscode.WebviewPanel | undefined = undefined;
@@ -28,7 +28,7 @@ interface EmbeddingResponse {
 }
 
 // Global variable to store the built graph
-let semanticGraph: { nodes: INode[]; edges: IEdge[] } = { nodes: [], edges: [] };
+export let semanticGraph: CodeGraph = new CodeGraph();
 let isGraphBuilding = false;
 
 // IMPORTANT: Replace with your actual OpenAI API key for chat completions
@@ -112,7 +112,7 @@ export function activate(context: vscode.ExtensionContext) {
         console.log('[SaralFlow] Initial graph build triggered.');
         try {
             semanticGraph = await extractSemanticGraph(); // Build and store the graph
-            vscode.window.showInformationMessage(`SaralFlow: Graph build complete. Nodes: ${semanticGraph.nodes.length}, Edges: ${semanticGraph.edges.length}`);
+            vscode.window.showInformationMessage(`SaralFlow: Graph build complete. Nodes: ${semanticGraph.nodes.size}, Edges: ${semanticGraph.edges.length}`);
             console.log('[SaralFlow] Initial graph build complete.');
 
             // If a panel is already open, update it
@@ -144,10 +144,10 @@ export function activate(context: vscode.ExtensionContext) {
             vscode.window.showInformationMessage('SaralFlow: Graph build in progress. Please wait.');
             return;
         }
-        if (semanticGraph.nodes.length === 0) {
+        if (semanticGraph.nodes.size === 0) {
             vscode.window.showInformationMessage('SaralFlow: Graph is empty. Building now...');
             await vscode.commands.executeCommand('SaralFlow.buildGraphOnStartup'); // Build if empty
-            if (semanticGraph.nodes.length === 0) {
+            if (semanticGraph.nodes.size === 0) {
                  vscode.window.showWarningMessage('SaralFlow: Graph could not be built. Please check logs.');
                  return;
             }
@@ -209,14 +209,18 @@ export function activate(context: vscode.ExtensionContext) {
                 switch (message.command) {
                     case 'webviewReady':
                         if (graphPanel) { 
-                                graphPanel.webview.postMessage({ command: 'renderGraph', nodes: semanticGraph.nodes, edges: semanticGraph.edges });
+                            // CORRECTED LINE: Convert Map to an array of values before sending
+                            graphPanel.webview.postMessage({ 
+                                command: 'renderGraph', 
+                                nodes: Array.from(semanticGraph.nodes.values()), 
+                                edges: semanticGraph.edges 
+                            });
+                        } else {
+                            console.error("SaralFlow: Webview panel is not open. Cannot render graph.");
                         }
-                        else
-                        {
-                                console.error("SaralFlow: Webview panel is not open. Cannot render graph.");
-                        }
+                        break; // Add break to prevent fall-through
                     case 'nodeClicked':
-                        console.log('Node clicked in webview:', message.nodeId);
+                        /* console.log('Node clicked in webview:', message.nodeId);
                         // Example: Open the document and highlight the range of the clicked node
                         const clickedNode = currentGraph.getNode(message.nodeId);
                         if (clickedNode) {
@@ -226,7 +230,7 @@ export function activate(context: vscode.ExtensionContext) {
                                 console.error('Error opening document for clicked node:', err);
                                 vscode.window.showErrorMessage(`Could not open document for ${clickedNode.label}: ${err.message}`);
                             });
-                        }
+                        }*/
                         return;
                 }
             },
@@ -248,10 +252,10 @@ export function activate(context: vscode.ExtensionContext) {
             vscode.window.showInformationMessage('SaralFlow: Graph build in progress. Please wait.');
             return;
         }
-        if (semanticGraph.nodes.length === 0) {
+        if (semanticGraph.nodes.size === 0) {
             vscode.window.showInformationMessage('SaralFlow: Graph is empty. Building now...');
             await vscode.commands.executeCommand('SaralFlow.buildGraphOnStartup');
-            if (semanticGraph.nodes.length === 0) {
+            if (semanticGraph.nodes.size === 0) {
                  vscode.window.showWarningMessage('SaralFlow: Graph could not be built. Please check logs.');
                  return;
             }
@@ -464,7 +468,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposableSqlGenerator);
 
     context.subscriptions.push(vscode.commands.registerCommand('SaralFlow.proposeCodeFromStory', async () => {
-        if (!semanticGraph || semanticGraph.nodes.length === 0) {
+        if (!semanticGraph || semanticGraph.nodes.size === 0) {
             vscode.window.showWarningMessage('SaralFlow: Graph not built or is empty. Please build the graph first.');
             return;
         }
@@ -485,6 +489,8 @@ export function activate(context: vscode.ExtensionContext) {
         openSaralFlowWebview(context.extensionUri);
     }));
 
+
+
     // Create a status bar item
     const saralCodeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
     saralCodeStatusBarItem.text = `$(robot) SaralCode`;
@@ -500,6 +506,35 @@ export function activate(context: vscode.ExtensionContext) {
     sqlStatusBarItem.command = 'SaralFlow.openSqlGenerator'; // Link to the new command
     sqlStatusBarItem.show();
     context.subscriptions.push(sqlStatusBarItem);
+
+    // Add a file system watcher for code files
+    const codeFileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx,cs,py,sql,yaml}', false, false, false);
+    context.subscriptions.push(codeFileWatcher);
+
+    let graphUpdateTimeout: NodeJS.Timeout | undefined;
+
+    const debouncedGraphUpdate = (uri: vscode.Uri) => {
+        if (graphUpdateTimeout) {
+            clearTimeout(graphUpdateTimeout);
+        }
+        graphUpdateTimeout = setTimeout(async () => {
+            vscode.window.showInformationMessage(`SaralFlow: File change detected in ${vscode.workspace.asRelativePath(uri)}. Updating graph...`);
+            // Call your new incremental update function here
+            removeFileNodesFromGraph(uri);
+            await processFileAndAddToGraph(uri);
+            vscode.window.showInformationMessage('SaralFlow: Graph update complete.');
+        }, 2000); // 2-second debounce
+    };
+
+    // Listen for file changes, creations, and deletions
+    codeFileWatcher.onDidChange(debouncedGraphUpdate);
+    codeFileWatcher.onDidCreate(debouncedGraphUpdate);
+    codeFileWatcher.onDidDelete(async (uri) => {
+        vscode.window.showInformationMessage(`SaralFlow: File deleted: ${vscode.workspace.asRelativePath(uri)}. Updating graph...`);
+        // Immediately remove deleted file's nodes without debounce
+        await removeFileNodesFromGraph(uri);
+        vscode.window.showInformationMessage('SaralFlow: Graph update complete.');
+});
 }
 
 
@@ -1023,18 +1058,18 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
     const relevantNodes: INode[] = [];
     const queue: { nodeId: string, depth: number }[] = [];
 
-    
     // --- Get embedding for the query text ---
     const queryEmbedding = await getEmbedding(queryText, OPENAI_EMBEDDING_API_KEY);
-    
 
     // --- Phase 1: Semantic & Keyword Matching (Seed Nodes) ---
     console.log(`[SaralFlow Graph] Starting semantic and keyword matching for query "${queryText}".`);
-    for (const node of semanticGraph.nodes) {
+
+    // Iterate over the nodes map to find initial matches
+    for (const [nodeId, node] of semanticGraph.nodes.entries()) {
         let isMatch = false;
         let similarityScore = 0;
 
-        // Keyword Match
+        // Keyword Match: Search in label, kind, id, and URI
         if (node.label.toLowerCase().includes(lowerCaseQuery) ||
             node.kind.toLowerCase().includes(lowerCaseQuery) ||
             node.id.toLowerCase().includes(lowerCaseQuery) ||
@@ -1043,19 +1078,12 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
             isMatch = true;
         }
 
-        // Semantic Match (only if an embedding was successfully generated for the query)
-        if (queryEmbedding && node.label) { // Use node.detail or a combination of label/kind/snippet for embedding
-            // Generate embedding for node's text. You might want to cache these embeddings for performance.
-            // For first run, generate on-the-fly. For production, consider storing them.
-            const nodeTextForEmbedding = `${node.kind} ${node.label} || ''}`; // Combine relevant text
-            const nodeEmbedding = node.embedding;
-
-            if (nodeEmbedding) {
-                similarityScore = cosineSimilarity(queryEmbedding, nodeEmbedding);
-                if (similarityScore >= similarityThreshold) {
-                    console.log(`[SaralFlow Graph] Semantic match: Node "${node.label}" (Kind: ${node.kind}), Score: ${similarityScore.toFixed(3)}`);
-                    isMatch = true; // Mark as match if similarity is high
-                }
+        // Semantic Match: Use pre-computed embedding
+        if (queryEmbedding && node.embedding) {
+            similarityScore = cosineSimilarity(queryEmbedding, node.embedding);
+            if (similarityScore >= similarityThreshold) {
+                console.log(`[SaralFlow Graph] Semantic match: Node "${node.label}" (Kind: ${node.kind}), Score: ${similarityScore.toFixed(3)}`);
+                isMatch = true;
             }
         }
 
@@ -1066,7 +1094,7 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
         }
     }
 
-    // --- Phase 2: Graph Traversal (BFS) (remains mostly the same) ---
+    // --- Phase 2: Graph Traversal (BFS) ---
     console.log(`[SaralFlow Graph] Starting graph traversal for query "${queryText}" with maxDepth ${maxDepth}. Initial nodes: ${relevantNodes.length}`);
 
     let head = 0;
@@ -1081,7 +1109,8 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
         const outgoingEdges = semanticGraph.edges.filter(edge => edge.from === nodeId);
         for (const edge of outgoingEdges) {
             if (!visitedNodes.has(edge.to)) {
-                const connectedNode = semanticGraph.nodes.find(n => n.id === edge.to);
+                // Use Map.get() for efficient O(1) lookup
+                const connectedNode = semanticGraph.nodes.get(edge.to);
                 if (connectedNode) {
                     relevantNodes.push(connectedNode);
                     visitedNodes.add(connectedNode.id);
@@ -1094,7 +1123,8 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
         const incomingEdges = semanticGraph.edges.filter(edge => edge.to === nodeId);
         for (const edge of incomingEdges) {
             if (!visitedNodes.has(edge.from)) {
-                const connectedNode = semanticGraph.nodes.find(n => n.id === edge.from);
+                // Use Map.get() for efficient O(1) lookup
+                const connectedNode = semanticGraph.nodes.get(edge.from);
                 if (connectedNode) {
                     relevantNodes.push(connectedNode);
                     visitedNodes.add(connectedNode.id);
@@ -1104,7 +1134,7 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
         }
     }
 
-    // Optional: Sort nodes for consistent output (already present)
+    // Optional: Sort nodes for consistent output
     relevantNodes.sort((a, b) => {
         if (a.uri !== b.uri) {
             return a.uri.localeCompare(b.uri);
@@ -1222,12 +1252,16 @@ async function proposeCodeFromStory(userStory: string) {
 }
 
 function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
-    if (!semanticGraph) { return []; }
+    // Check if the semantic graph is initialized and has nodes
+    if (!semanticGraph || semanticGraph.nodes.size === 0) { 
+        return []; 
+    }
 
     const relevantNodes: { node: INode, score: number }[] = [];
     const topN = 10; // Number of top relevant nodes to include as context
 
-    for (const node of semanticGraph.nodes) {
+    // Iterate over the values of the Map
+    for (const node of semanticGraph.nodes.values()) {
         if (node.embedding) {
             const similarity = cosineSimilarity(storyEmbedding, node.embedding);
             relevantNodes.push({ node, score: similarity });
