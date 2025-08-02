@@ -15,17 +15,10 @@
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-      {
-        "command": "SaralFlow.helloWorld",
-        "title": "Hello World"
-      },
+      
       {
         "command": "SaralFlow.showGraph",
         "title": "Show Code Semantic Graph"
-      },
-      {
-        "command": "SaralFlow.openSqlGenerator",
-        "title": "SaralFlow: Open SQL Generator"
       },
       {
         "command": "SaralFlow.queryGraphForLLM",

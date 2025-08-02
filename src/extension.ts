@@ -56,49 +56,7 @@ let sqlFilesBaseUri: vscode.Uri | undefined;
 export function activate(context: vscode.ExtensionContext) {
     extensionContext = context;
 
-    console.log('Congratulations, your extension "SaralFlow" is now active!');
-
-    // Initial load of the schema context when the extension activates
-    // This ensures the vector store is ready when the user first opens the generator.
-    loadSchemaContext();
-
-    // Set up a file system watcher to detect changes in .sql files
-    // This will trigger a reload of the schema context when files are added, changed, or deleted.
-    const sqlWatcher = vscode.workspace.createFileSystemWatcher('**/*.sql');
-
-    // Debounce the context reload to prevent excessive API calls and re-embeddings
-    let reloadTimeout: NodeJS.Timeout | undefined;
-    const debouncedReload = () => {
-        if (reloadTimeout) {
-            clearTimeout(reloadTimeout);
-        }
-        reloadTimeout = setTimeout(() => {
-            vscode.window.showInformationMessage('SQL files changed. Reloading schema context...');
-            loadSchemaContext();
-        }, 2000); // 2-second debounce
-    };
-
-    sqlWatcher.onDidChange(debouncedReload);
-    sqlWatcher.onDidCreate(debouncedReload);
-    sqlWatcher.onDidDelete(debouncedReload);
-
-    // Ensure the watcher is disposed when the extension deactivates
-    context.subscriptions.push(sqlWatcher);
-
-
-    // Register the existing "Hello World" command
-    const disposableHelloWorld = vscode.commands.registerCommand('SaralFlow.helloWorld', () => {
-        vscode.window.showInformationMessage('Hello World from SaralFlow!');
-    });
-    context.subscriptions.push(disposableHelloWorld);
-
-    // Create a status bar item
-    const memGraphStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
-    memGraphStatusBarItem.text = `$(robot) SaralGraph`;
-    memGraphStatusBarItem.tooltip = 'Show Graph';
-    memGraphStatusBarItem.command = 'SaralFlow.showGraph'; // Link to the new command
-    memGraphStatusBarItem.show();
-    context.subscriptions.push(memGraphStatusBarItem);
+    
 
     
     // *** Initial Graph Building on Activation ***
@@ -312,160 +270,6 @@ export function activate(context: vscode.ExtensionContext) {
     });
     context.subscriptions.push(queryGraphCommand);
 
-    // Register the new command to open the SQL Generator UI
-    const disposableSqlGenerator = vscode.commands.registerCommand('SaralFlow.openSqlGenerator', () => {
-        // Create and show a new webview panel
-        const panel = vscode.window.createWebviewPanel(
-            'saralFlowSqlGenerator', // Unique ID for the panel
-            'SaralFlow SQL Generator', // Title displayed in the panel header
-            vscode.ViewColumn.One, // Editor column to show the new webview panel in.
-            {
-                enableScripts: true // Enable JavaScript in the webview
-            }
-        );
-    
-    
-
-        // Set the HTML content for the webview
-        panel.webview.html = getWebviewContent(panel.webview, context.extensionUri);
-
-        // Handle messages from the webview
-        panel.webview.onDidReceiveMessage(
-            async message => { // Mark as async because we'll be using await for fetch
-                switch (message.command) {
-                    case 'generateSql':
-                        const scenario = message.text;
-                        let proposedSql = '';
-
-                       
-
-                        // Use the cached schema chunks directly
-                        if (isSchemaLoading) {
-                            proposedSql = 'Schema context is currently loading. Please wait a moment and try again.';
-                            panel.webview.postMessage({ command: 'displaySql', text: proposedSql });
-                            vscode.window.showWarningMessage('SQL schema context is still loading. Please wait.');
-                            return;
-                        }
-
-                        let relevantSqlContext = '';
-                        if (cachedSchemaChunks.length > 0) {
-                            panel.webview.postMessage({ command: 'displaySql', text: 'Searching for relevant schema...' }); // Update UI
-                            // 1. Embed the user's scenario
-                            const scenarioEmbedding = await getEmbedding(scenario, OPENAI_EMBEDDING_API_KEY);
-
-                            if (scenarioEmbedding) {
-                                // 2. Perform similarity search on cached chunks
-                                const topN = 5; // Get top 5 most relevant schema chunks
-                                const rankedChunks = cachedSchemaChunks
-                                    .map(chunk => ({
-                                        text: chunk.text,
-                                        similarity: cosineSimilarity(scenarioEmbedding, chunk.embedding)
-                                    }))
-                                    .sort((a, b) => b.similarity - a.similarity) // Sort descending by similarity
-                                    .slice(0, topN); // Take top N
-
-                                relevantSqlContext = rankedChunks
-                                    .map(chunk => `-- Similarity: ${chunk.similarity.toFixed(4)}\n${chunk.text}`)
-                                    .join('\n-- --- Relevant Schema Chunk ---\n');
-
-                                vscode.window.showInformationMessage(`Found ${rankedChunks.length} relevant schema chunks.`);
-                            } else {
-                                vscode.window.showErrorMessage('Failed to generate embedding for scenario.');
-                            }
-                        } else {
-                            vscode.window.showInformationMessage('No SQL files found or processed for context. Please ensure .sql files are in your workspace.');
-                        }
-
-
-                        // Construct the prompt for the LLM with filtered context
-                        const prompt = `You are an expert SQL Server database developer.
-                                        Generate SQL Server DDL (Data Definition Language) statements.
-                                        For new tables, provide 'CREATE TABLE' statements.
-                                        For changes to existing tables (e.g., adding a column, modifying a column), provide the full 'CREATE TABLE' statement reflecting the new desired state. Do NOT use ALTER TABLE for these types of changes, instead provide the complete CREATE TABLE statement.
-                                        For new stored procedures, views, or functions, provide 'CREATE PROCEDURE', 'CREATE VIEW', or 'CREATE FUNCTION' statements.
-                                        For modifications to existing stored procedures, views, or functions, provide 'CREATE OR ALTER PROCEDURE', 'CREATE OR ALTER VIEW', or 'CREATE OR ALTER FUNCTION' statements to ensure idempotency.
-                                        For dropping objects, provide 'DROP TABLE', 'DROP PROCEDURE', 'DROP VIEW', or 'DROP FUNCTION' statements.
-                                        IMPORTANT: Each distinct DDL statement (CREATE, ALTER, DROP) MUST be separated by a 'GO' command on its own line. For example:
-                                        CREATE TABLE MyNewTable (Id INT PRIMARY KEY);
-                                        GO
-                                        CREATE OR ALTER PROCEDURE MySproc AS BEGIN SELECT 1; END;
-                                        GO
-                                        ALTER TABLE ExistingTable ADD NewColumn INT; -- Note: LLM should avoid ALTER TABLE for full table changes as per above.
-                                        GO
-                                        Focus on SQL Server syntax. Consider the existing database schema provided below.
-                                        Provide only the SQL code, no conversational text or explanations. If no changes are needed, state "No changes needed."
-
-                                        --- Relevant Existing SQL Server Schema Context ---
-                                        ${relevantSqlContext || 'No relevant existing SQL schema context found.'}
-                                        --- End of Schema Context ---
-
-                                        Scenario: "${scenario}"
-
-                                        SQL:`;
-
-                        try {
-                            panel.webview.postMessage({ command: 'displaySql', text: 'Sending to LLM for generation...' }); // Update UI
-                            const response = await fetch('https://api.openai.com/v1/chat/completions', {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                    'Authorization': `Bearer ${OPENAI_CHAT_API_KEY}`
-                                },
-                                body: JSON.stringify({
-                                    model: 'gpt-3.5-turbo', // Consider 'gpt-4' for better context handling
-                                    messages: [{ role: 'user', content: prompt }],
-                                    temperature: 0.7,
-                                    max_tokens: 1000
-                                })
-                            });
-
-                            if (!response.ok) {
-                                const errorData: any = await response.json();
-                                console.error('OpenAI API error:', errorData);
-                                throw new Error(`OpenAI API error: ${response.status} - ${errorData.error ? errorData.error.message : response.statusText}`);
-                            }
-
-                            const data: any = await response.json();
-                            proposedSql = data.choices[0].message.content.trim();
-
-                        } catch (error: any) {
-                            console.error('Error generating SQL:', error);
-                            proposedSql = `Error generating SQL: ${error.message || 'An unknown error occurred.'}\n\nPlease check your API key, internet connection, and ensure your prompt/context are not too large for the LLM.`;
-                            vscode.window.showErrorMessage(`Failed to generate SQL: ${error.message || 'Check Debug Console.'}`);
-                        }
-                        // --- LLM Integration Ends Here ---
-
-                        // Send the proposed SQL back to the webview
-                        panel.webview.postMessage({ command: 'displaySql', text: proposedSql });
-                        return;
-
-                    case 'acceptChange':
-                        const sqlToApply = message.text;
-                        if (sqlToApply.trim()) {
-                            vscode.window.showInformationMessage(
-                                'Are you sure you want to apply these SQL changes to your project?',
-                                'Yes', 'No'
-                            ).then(async selection => {
-                                if (selection === 'Yes') {
-                                    panel.webview.postMessage({ command: 'displaySql', text: 'Applying changes...' });
-                                    await applySqlChanges(sqlToApply);
-                                    panel.webview.postMessage({ command: 'displaySql', text: 'Changes applied. Please review your files.' });
-                                } else {
-                                    panel.webview.postMessage({ command: 'displaySql', text: 'Changes not applied.' });
-                                }
-                            });
-                        } else {
-                            vscode.window.showWarningMessage('No SQL code to apply.');
-                        }
-                        return;
-                }
-            },
-            undefined,
-            context.subscriptions
-        );
-    });
-
-    context.subscriptions.push(disposableSqlGenerator);
 
     context.subscriptions.push(vscode.commands.registerCommand('SaralFlow.proposeCodeFromStory', async () => {
         if (!semanticGraph || semanticGraph.nodes.size === 0) {
@@ -499,13 +303,14 @@ export function activate(context: vscode.ExtensionContext) {
     saralCodeStatusBarItem.show();
     context.subscriptions.push(saralCodeStatusBarItem);
 
-    // Add a status bar item for quick access to the SQL Generator
-    const sqlStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
-    sqlStatusBarItem.text = `$(flame) SaralFlow`;
-    sqlStatusBarItem.tooltip = 'Open SaralFlow Code Generator';
-    sqlStatusBarItem.command = 'SaralFlow.openSqlGenerator'; // Link to the new command
-    sqlStatusBarItem.show();
-    context.subscriptions.push(sqlStatusBarItem);
+    // Create a status bar item
+    const memGraphStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+    memGraphStatusBarItem.text = `$(robot) SaralGraph`;
+    memGraphStatusBarItem.tooltip = 'Show Graph';
+    memGraphStatusBarItem.command = 'SaralFlow.showGraph'; // Link to the new command
+    memGraphStatusBarItem.show();
+    context.subscriptions.push(memGraphStatusBarItem);
+    
 
     // Add a file system watcher for code files
     const codeFileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx,cs,py,sql,yaml}', false, false, false);
@@ -554,513 +359,6 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 
-
-/**
- * Loads the SQL project context by finding, chunking, and embedding .sql files.
- * Updates the global `cachedSchemaChunks` variable and `sqlFilesBaseUri`.
- */
-async function loadSchemaContext() {
-    if (isSchemaLoading) {
-        console.log('Schema loading is already in progress. Skipping new load request.');
-        return;
-    }
-    isSchemaLoading = true;
-    cachedSchemaChunks = []; // Clear existing cache
-    sqlFilesBaseUri = undefined; // Clear existing base URI
-
-    try {
-        const dboFolders = await vscode.workspace.findFiles('**/dbo', '**/node_modules/**', 1);
-
-        if (dboFolders.length > 0) {
-            sqlFilesBaseUri = dboFolders[0];
-            vscode.window.showInformationMessage(`Found SQL base folder: ${sqlFilesBaseUri.fsPath}`);
-        } else if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-            sqlFilesBaseUri = vscode.workspace.workspaceFolders[0].uri;
-            vscode.window.showWarningMessage('Could not find a "dbo" folder. Assuming SQL files are relative to workspace root.');
-        } else {
-            vscode.window.showErrorMessage('No workspace folder open. Cannot load SQL context.');
-            isSchemaLoading = false;
-            return;
-        }
-
-        const sqlFiles = await vscode.workspace.findFiles('**/*.sql', '**/node_modules/**', 100);
-
-        if (sqlFiles.length === 0) {
-            vscode.window.showInformationMessage('No .sql files found in the workspace for context. The generator will proceed without schema context.');
-            isSchemaLoading = false;
-            return;
-        }
-
-        const relevantSqlFiles = sqlFiles.filter(fileUri => fileUri.fsPath.startsWith(sqlFilesBaseUri!.fsPath));
-
-        if (relevantSqlFiles.length === 0) {
-            vscode.window.showInformationMessage('No relevant .sql files found under the determined SQL base folder.');
-            isSchemaLoading = false;
-            return;
-        }
-
-        vscode.window.showInformationMessage(`Found ${relevantSqlFiles.length} relevant .sql files for context. Generating embeddings... This might take a moment.`);
-        
-        let allChunks: { text: string; fileUri: vscode.Uri }[] = [];
-        for (const fileUri of relevantSqlFiles) {
-            try {
-                const fileContent = await vscode.workspace.fs.readFile(fileUri);
-                const sqlText = new TextDecoder().decode(fileContent);
-                
-                // Chunking logic remains the same
-                const chunks = sqlText.split(/(CREATE TABLE|ALTER TABLE|CREATE PROCEDURE|ALTER PROCEDURE|INSERT INTO|UPDATE|DELETE FROM)\s/gi)
-                                     .filter(chunk => chunk.trim().length > 0)
-                                     .map((chunk, index, arr) => {
-                                        if (index > 0 && arr[index - 1].match(/^(CREATE TABLE|ALTER TABLE|CREATE PROCEDURE|ALTER PROCEDURE|INSERT INTO|UPDATE|DELETE FROM)$/i)) {
-                                            return arr[index - 1] + ' ' + chunk;
-                                        }
-                                        return chunk;
-                                     })
-                                     .filter(chunk => chunk.trim().length > 0);
-
-                for (const chunk of chunks) {
-                    allChunks.push({ text: chunk, fileUri: fileUri });
-                }
-            } catch (readError: any) {
-                console.warn(`Could not process file ${fileUri.fsPath}: ${readError.message}`);
-            }
-        }
-        
-        // --- THIS IS THE NEW PARALLEL EMBEDDING SECTION ---
-        
-        // 1. Create an array of Promises for each embedding call
-        const embeddingPromises = allChunks.map(chunkInfo => 
-            getEmbedding(chunkInfo.text, OPENAI_EMBEDDING_API_KEY)
-                .then(embedding => ({ text: chunkInfo.text, embedding })) // Attach the original chunk text to the result
-        );
-
-        // 2. Wait for all promises to resolve in parallel
-        const results = await Promise.all(embeddingPromises);
-
-        // 3. Filter out any failed embedding calls (where embedding is undefined)
-        cachedSchemaChunks = results.filter(result => result.embedding !== undefined) as { text: string; embedding: number[] }[];
-        
-        // --- END OF NEW SECTION ---
-        
-        vscode.window.showInformationMessage(`Generated embeddings for ${cachedSchemaChunks.length} schema chunks. Context ready.`);
-    } catch (error: any) {
-        console.error('Error finding, reading, or embedding SQL files:', error);
-        vscode.window.showErrorMessage(`Error processing SQL project context: ${error.message}`);
-        cachedSchemaChunks = []; // Clear cache on error
-        sqlFilesBaseUri = undefined; // Clear base URI on error
-    } finally {
-        isSchemaLoading = false;
-    }
-}
-
-
-
-/**
- * Applies the generated SQL code to the project files.
- * This function parses the SQL, determines file paths, and writes/updates files.
- * @param sqlCode The SQL code generated by the LLM.
- */
-async function applySqlChanges(sqlCode: string) {
-    if (!sqlFilesBaseUri) {
-        vscode.window.showErrorMessage('SQL base folder not identified. Please ensure your project has a "dbo" folder or similar structure.');
-        return;
-    }
-
-    const statements = splitSqlStatements(sqlCode); // Split into individual statements
-
-    // Check if the LLM returned multiple objects in a single 'GO' block
-    if (statements.length === 1 && containsMultipleSqlObjects(statements[0])) {
-        vscode.window.showWarningMessage(
-            'The generated SQL contains multiple object definitions in a single block. ' +
-            'Please ensure the LLM separates each object with a "GO" command for proper file splitting. ' +
-            'You may need to manually split this file after applying changes.',
-            'Understood'
-        );
-    }
-
-    for (const stmt of statements) {
-        const { type, name, action } = getSqlObjectNameTypeAndAction(stmt); // Get action (CREATE, ALTER, DROP)
-        console.log(`Processing statement: Action=${action}, Type=${type}, Name=${name}, StatementSnippet=${stmt.substring(0, 50)}...`);
-
-        if (!type || !name || !action) {
-            vscode.window.showWarningMessage(`Could not determine object type, name, or action for SQL statement: ${stmt.substring(0, 50)}... Skipping.`);
-            console.warn('Skipping statement due to unknown type/name/action.');
-            continue;
-        }
-
-        const targetRelativePathInDbo = resolveSqlFilePath(type, name); // This returns path relative to dbo
-        if (!targetRelativePathInDbo) {
-            // resolveSqlFilePath already shows a warning if type is unsupported (e.g., DML)
-            continue;
-        }
-
-        // Construct the full URI using the resolved sqlFilesBaseUri (the dbo folder)
-        const targetFileUri = vscode.Uri.joinPath(sqlFilesBaseUri, targetRelativePathInDbo);
-        console.log(`Target file URI: ${targetFileUri.fsPath}`);
-
-        try {
-            let fileExists = false;
-            try {
-                await vscode.workspace.fs.stat(targetFileUri);
-                fileExists = true;
-                console.log(`File ${targetFileUri.fsPath} exists.`);
-            } catch (e: any) {
-                if (e.code === 'FileNotFound') {
-                    console.log(`File ${targetFileUri.fsPath} does not exist.`);
-                } else {
-                    console.warn(`Error checking file ${targetFileUri.fsPath}: ${e.message}`);
-                }
-            }
-
-            if (action === 'CREATE' || action === 'CREATE OR ALTER') { // Handle CREATE OR ALTER as a CREATE action for file management
-                if (fileExists) {
-                    const selection = await vscode.window.showInformationMessage(
-                        `File for ${type} ${name} already exists. What do you want to do?`,
-                        'Overwrite', 'Append', 'Cancel'
-                    );
-                    if (selection === 'Overwrite') {
-                        console.log(`Overwriting ${targetFileUri.fsPath} with new content.`);
-                        await vscode.workspace.fs.writeFile(targetFileUri, new TextEncoder().encode(stmt.trim()));
-                        vscode.window.showInformationMessage(`Overwrote existing ${type} ${name} at ${targetFileUri.fsPath.replace(sqlFilesBaseUri.fsPath, '')}.`);
-                    } else if (selection === 'Append') {
-                        console.log(`Appending to ${targetFileUri.fsPath}.`);
-                        const existingContent = new TextDecoder().decode(await vscode.workspace.fs.readFile(targetFileUri));
-                        await vscode.workspace.fs.writeFile(targetFileUri, new TextEncoder().encode(existingContent.trim() + '\n\n' + stmt.trim()));
-                        vscode.window.showInformationMessage(`Appended new ${type} ${name} to existing file ${targetFileUri.fsPath.replace(sqlFilesBaseUri.fsPath, '')}.`);
-                    } else {
-                        vscode.window.showInformationMessage(`Action for ${type} ${name} cancelled.`);
-                        console.log(`Action for ${type} ${name} cancelled by user.`);
-                        continue; // Skip to next statement
-                    }
-                } else {
-                    // For new files, ensure the directory exists
-                    const dirUri = vscode.Uri.file(path.dirname(targetFileUri.fsPath));
-                    console.log(`Creating directory ${dirUri.fsPath} for new file.`);
-                    await vscode.workspace.fs.createDirectory(dirUri);
-                    console.log(`Writing new file ${targetFileUri.fsPath}.`);
-                    await vscode.workspace.fs.writeFile(targetFileUri, new TextEncoder().encode(stmt.trim()));
-                    vscode.window.showInformationMessage(`Created new file for ${type} ${name} at ${targetFileUri.fsPath.replace(sqlFilesBaseUri.fsPath, '')}.`);
-                }
-            } else if (action === 'ALTER') {
-                if (fileExists) {
-                    console.log(`Appending ALTER statement to existing file ${targetFileUri.fsPath}.`);
-                    const existingContent = new TextDecoder().decode(await vscode.workspace.fs.readFile(targetFileUri));
-                    await vscode.workspace.fs.writeFile(targetFileUri, new TextEncoder().encode(existingContent.trim() + '\n\n' + stmt.trim()));
-                    vscode.window.showInformationMessage(`Appended ALTER statement for ${type} ${name} to ${targetFileUri.fsPath.replace(sqlFilesBaseUri.fsPath, '')}.`);
-                } else {
-                    vscode.window.showWarningMessage(`Cannot ALTER ${type} ${name}. File does not exist at ${targetFileUri.fsPath.replace(sqlFilesBaseUri.fsPath, '')}. Skipping.`);
-                    console.warn(`Cannot ALTER non-existent file: ${targetFileUri.fsPath}`);
-                }
-            } else if (action === 'DROP') {
-                if (fileExists) {
-                    const selection = await vscode.window.showInformationMessage(
-                        `Are you sure you want to DELETE the file for ${type} ${name}? This action cannot be undone easily.`,
-                        'Yes, Delete', 'No, Keep'
-                    );
-                    if (selection === 'Yes, Delete') {
-                        console.log(`Deleting file ${targetFileUri.fsPath}.`);
-                        await vscode.workspace.fs.delete(targetFileUri, { recursive: false, useTrash: true }); // Move to trash
-                        vscode.window.showInformationMessage(`Deleted file for ${type} ${name} from ${targetFileUri.fsPath.replace(sqlFilesBaseUri.fsPath, '')}.`);
-                    } else {
-                        vscode.window.showInformationMessage(`Deletion of ${type} ${name} cancelled.`);
-                        console.log(`Deletion of ${type} ${name} cancelled by user.`);
-                    }
-                } else {
-                    vscode.window.showInformationMessage(`Cannot DROP ${type} ${name}. File does not exist at ${targetFileUri.fsPath.replace(sqlFilesBaseUri.fsPath, '')}. It might already be removed.`);
-                    console.log(`Cannot DROP non-existent file: ${targetFileUri.fsPath}`);
-                }
-            } else {
-                vscode.window.showWarningMessage(`Unsupported SQL action '${action}' for ${type} ${name}. Skipping statement.`);
-                console.warn(`Unsupported action: ${action} for ${type} ${name}`);
-            }
-
-            // Open the file in the editor after writing/modifying (if it still exists)
-            if (action !== 'DROP' || (action === 'DROP' && !fileExists)) { // Only open if not deleting, or if it was a non-existent drop
-                try {
-                    const document = await vscode.workspace.openTextDocument(targetFileUri);
-                    await vscode.window.showTextDocument(document);
-                    console.log(`Opened file ${targetFileUri.fsPath} in editor.`);
-                } catch (openError: any) {
-                    // This might happen if a file was just deleted
-                    console.warn(`Could not open file ${targetFileUri.fsPath}: ${openError.message}`);
-                }
-            }
-
-
-        } catch (writeError: any) {
-            vscode.window.showErrorMessage(`Failed to apply SQL change for ${type} ${name}: ${writeError.message}`);
-            console.error(`Error writing to file ${targetFileUri.fsPath}:`, writeError);
-        }
-    }
-    vscode.window.showInformationMessage('SQL changes application complete. Please review affected files.');
-}
-
-/**
- * Splits a block of SQL code into individual statements.
- * Uses 'GO' as a delimiter, common in SQL Server.
- * @param sqlCode The full SQL code string.
- * @returns An array of individual SQL statements.
- */
-function splitSqlStatements(sqlCode: string): string[] {
-    // Split by 'GO' keyword on a new line, case-insensitive, and trim empty results
-    return sqlCode.split(/^\s*GO\s*$/gim)
-                  .map(s => s.trim())
-                  .filter(s => s.length > 0);
-}
-
-/**
- * Checks if a single SQL block contains definitions for multiple distinct SQL objects.
- * This is a heuristic to warn the user if the LLM failed to insert 'GO' delimiters.
- * @param sqlBlock A single SQL statement block (potentially containing multiple objects).
- * @returns True if multiple object definitions are detected, false otherwise.
- */
-function containsMultipleSqlObjects(sqlBlock: string): boolean {
-    const objectDefinitionKeywords = [
-        'CREATE\\s+TABLE', 'ALTER\\s+TABLE',
-        'CREATE\\s+PROCEDURE', 'ALTER\\s+PROCEDURE', 'CREATE\\s+OR\\s+ALTER\\s+PROCEDURE',
-        'CREATE\\s+VIEW', 'ALTER\\s+VIEW', 'CREATE\\s+OR\\s+ALTER\\s+VIEW',
-        'CREATE\\s+FUNCTION', 'ALTER\\s+FUNCTION', 'CREATE\\s+OR\\s+ALTER\\s+FUNCTION',
-        'DROP\\s+TABLE', 'DROP\\s+PROCEDURE', 'DROP\\s+VIEW', 'DROP\\s+FUNCTION'
-    ];
-    const regex = new RegExp(objectDefinitionKeywords.join('|'), 'gi');
-    
-    // Count occurrences of object definition keywords
-    const matches = sqlBlock.match(regex);
-    return matches ? matches.length > 1 : false;
-}
-
-/**
- * Extracts the object type (TABLE, PROCEDURE, etc.), name, and action (CREATE, ALTER, DROP) from a SQL statement.
- * @param sqlStatement The SQL statement.
- * @returns An object with 'type', 'name', and 'action', or null if not found.
- */
-function getSqlObjectNameTypeAndAction(sqlStatement: string): { type: string | null, name: string | null, action: string | null } {
-    let type: string | null = null;
-    let name: string | null = null;
-    let action: string | null = null;
-
-    // Regex for CREATE/ALTER/DROP TABLE
-    let match = sqlStatement.match(/^(CREATE|ALTER|DROP)\s+TABLE\s+\[?(\w+)\]?(?:\.\[?(\w+)\]?)?/i);
-    if (match) {
-        action = match[1].toUpperCase();
-        type = 'TABLE';
-        name = match[3] || match[2]; // Prioritize schema.objectname, otherwise just objectname
-        return { type, name, action };
-    }
-
-    // Regex for CREATE/ALTER/DROP PROCEDURE
-    // Updated regex to specifically capture 'CREATE OR ALTER' as a single action if present
-    match = sqlStatement.match(/^(CREATE\s+OR\s+ALTER|CREATE|ALTER|DROP)\s+PROCEDURE\s+\[?(\w+)\]?(?:\.\[?(\w+)\]?)?/i);
-    if (match) {
-        action = match[1].toUpperCase().replace(/\s+/g, ' '); // Normalize 'CREATE OR ALTER'
-        type = 'STORED_PROCEDURE';
-        name = match[3] || match[2];
-        return { type, name, action };
-    }
-
-    // Regex for CREATE/ALTER/DROP VIEW
-    match = sqlStatement.match(/^(CREATE|ALTER|DROP)\s+VIEW\s+\[?(\w+)\]?(?:\.\[?(\w+)\]?)?/i);
-    if (match) {
-        action = match[1].toUpperCase();
-        type = 'VIEW';
-        name = match[3] || match[2];
-        return { type, name, action };
-    }
-
-    // Regex for CREATE/ALTER/DROP FUNCTION
-    match = sqlStatement.match(/^(CREATE|ALTER|DROP)\s+FUNCTION\s+\[?(\w+)\]?(?:\.\[?(\w+)\]?)?/i);
-    if (match) {
-        action = match[1].toUpperCase();
-        type = 'FUNCTION';
-        name = match[3] || match[2];
-        return { type, name, action };
-    }
-
-    // Fallback for DML (INSERT, UPDATE, DELETE) - these don't map to specific files in this structure
-    if (sqlStatement.match(/^(INSERT|UPDATE|DELETE)\s+FROM/i)) {
-        action = sqlStatement.match(/^(INSERT|UPDATE|DELETE)/i)![1].toUpperCase();
-        type = 'DML'; // A generic type for DML
-        name = 'DML_Statement'; // Generic name, as DML doesn't have a single object name
-        return { type, name, action };
-    }
-
-
-    return { type: null, name: null, action: null };
-}
-
-/**
- * Resolves the relative file path for a given SQL object type and name, relative to the 'dbo' folder.
- * Assumes a structure like:
- * - /Tables/MyTable.sql
- * - /Stored Procedures/MySproc.sql
- * @param objectType The type of SQL object (e.g., 'TABLE', 'STORED_PROCEDURE').
- * @param objectName The name of the SQL object.
- * @returns The relative path *within the 'dbo' folder*, or null if the type is not recognized.
- */
-function resolveSqlFilePath(objectType: string, objectName: string): string | null {
-    const fileName = `${objectName}.sql`;
-    switch (objectType.toUpperCase()) {
-        case 'TABLE':
-            return path.join('Tables', fileName);
-        case 'STORED_PROCEDURE':
-            return path.join('Stored Procedures', fileName);
-        case 'VIEW':
-            return path.join('Views', fileName); // Assuming a 'Views' folder
-        case 'FUNCTION':
-            return path.join('Functions', fileName); // Assuming a 'Functions' folder
-        case 'DML':
-            // DML statements usually don't go into dedicated files by object name.
-            // You might want to handle these differently (e.g., append to a script.sql or log).
-            // For now, we'll return null to prevent creating files for DML.
-            vscode.window.showWarningMessage(`DML statements are not automatically saved to object-specific files. Please copy manually.`);
-            return null;
-        default:
-            vscode.window.showWarningMessage(`Unsupported SQL object type for file path resolution: ${objectType}`);
-            return null;
-    }
-}
-
-
-function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
-    // Local path to the Tailwind CSS CDN script
-    const tailwindCssCdnUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'node_modules', 'tailwindcss', 'tailwind.min.js'));
-
-    // Note: Tailwind CSS is typically used via CDN for quick prototyping in webviews.
-    // For production, you'd usually compile it.
-    // We're loading it directly from node_modules for self-containment.
-    // Make sure 'tailwindcss' is installed as a dev dependency: npm install -D tailwindcss
-
-    return `<!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>SaralFlow SQL Generator</title>
-        <!-- Load Tailwind CSS from CDN -->
-        <script src="https://cdn.tailwindcss.com"></script>
-        <style>
-            body {
-                font-family: 'Inter', sans-serif;
-                background-color: #1e1e1e; /* VS Code dark background */
-                color: #cccccc; /* VS Code foreground color */
-            }
-            textarea {
-                background-color: #333333; /* Darker background for textareas */
-                color: #cccccc;
-                border: 1px solid #555555;
-                border-radius: 8px; /* Rounded corners */
-                padding: 12px;
-                resize: vertical; /* Allow vertical resizing */
-                font-family: monospace; /* Monospace for code */
-            }
-            button {
-                background-color: #007acc; /* VS Code primary blue */
-                color: white;
-                padding: 10px 20px;
-                border-radius: 8px;
-                cursor: pointer;
-                transition: background-color 0.2s;
-                font-weight: bold;
-            }
-            button:hover {
-                background-color: #005f99;
-            }
-            .button-group {
-                display: flex;
-                gap: 1rem; /* Space between buttons */
-                justify-content: center;
-                margin-top: 1.5rem;
-            }
-            .button-group button {
-                flex-grow: 1; /* Allow buttons to grow */
-                max-width: 200px; /* Limit max width */
-            }
-            /* Specific styling for the Generate SQL button */
-            #generateButton {
-                background-color: #007acc; /* VS Code primary blue */
-                color: white;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); /* Subtle shadow */
-                border: none; /* Remove default border */
-            }
-            #generateButton:hover {
-                background-color: #005f99;
-                box-shadow: 0 6px 8px rgba(0, 0, 0, 0.2); /* Slightly larger shadow on hover */
-            }
-        </style>
-    </head>
-    <body class="p-6">
-        <div class="max-w-4xl mx-auto bg-gray-800 p-8 rounded-lg shadow-lg">
-            <h1 class="text-2xl font-bold mb-6 text-center text-white">Story to TSQL Code Generation</h1>
-
-            <div class="mb-6">
-                <label for="scenarioInput" class="block text-gray-300 text-sm font-bold mb-2">
-                    Story Description / Scenario:
-                </label>
-                <textarea id="scenarioInput" class="w-full h-32 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    placeholder="Describe what you want to do in a clear and concise way."></textarea>
-            </div>
-
-            <div class="button-group">
-                <button id="generateButton">Generate SQL</button>
-                <button id="acceptButton" class="bg-green-600 hover:bg-green-700">Accept Change</button>
-            </div>
-
-            <div class="mt-6">
-                <label for="proposedCodeOutput" class="block text-gray-300 text-sm font-bold mb-2">
-                    Proposed SQL Code:
-                </label>
-                <textarea id="proposedCodeOutput" class="w-full h-48 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    placeholder="Generated SQL code will appear here..." readonly></textarea>
-            </div>
-        </div>
-
-        <script>
-            const vscode = acquireVsCodeApi(); // VS Code API for webviews
-
-            const scenarioInput = document.getElementById('scenarioInput');
-            const generateButton = document.getElementById('generateButton');
-            const acceptButton = document.getElementById('acceptButton'); // Get the new button
-            const proposedCodeOutput = document.getElementById('proposedCodeOutput');
-
-            generateButton.addEventListener('click', () => {
-                const scenarioText = scenarioInput.value;
-                if (scenarioText.trim()) {
-                    vscode.postMessage({
-                        command: 'generateSql',
-                        text: scenarioText
-                    });
-                    proposedCodeOutput.value = 'Generating SQL...';
-                } else {
-                    proposedCodeOutput.value = 'Please enter a story description/scenario.';
-                }
-            });
-
-            // Add event listener for the new Accept Change button
-            acceptButton.addEventListener('click', () => {
-                const sqlToApply = proposedCodeOutput.value;
-                if (sqlToApply.trim() && sqlToApply !== 'Generating SQL...' && sqlToApply !== 'Error generating SQL...' && sqlToApply !== 'Changes not applied.' && sqlToApply !== 'Changes applied. Please review your files.') {
-                    vscode.postMessage({
-                        command: 'acceptChange',
-                        text: sqlToApply
-                    });
-                } else {
-                    vscode.window.showWarningMessage('No valid SQL code to apply.');
-                }
-            });
-
-            // Handle messages from the extension
-            window.addEventListener('message', event => {
-                const message = event.data;
-                switch (message.command) {
-                    case 'displaySql':
-                        proposedCodeOutput.value = message.text;
-                        break;
-                }
-            });
-        </script>
-    </body>
-    </html>`;
-}
 
 export function deactivate() {
     // Dispose of the file system watcher when the extension deactivates
@@ -1299,7 +597,7 @@ function createStoryPrompt(userStory: string, relevantFileContents: Map<string, 
         prompt += "**Relevant Code Context (Full File Contents):**\n";
         for (const [filePath, content] of relevantFileContents.entries()) {
             prompt += `--- Context File: ${filePath} ---\n`;
-            prompt += `\`\`\`csharp\n${content}\n\`\`\`\n\n`;
+            prompt += `\`\`\`code\n${content}\n\`\`\`\n\n`;
         }
     } else {
         prompt += "No relevant code context could be found or provided.\n\n";
@@ -1329,7 +627,6 @@ function createStoryPrompt(userStory: string, relevantFileContents: Map<string, 
     return prompt;
 }
 
-// (The `callLLM` function remains the same)
 
 async function displayLLMResponseAsNewFile(llmResponse: string) {
     const doc = await vscode.workspace.openTextDocument({ content: llmResponse, language: 'markdown' });
@@ -1506,7 +803,14 @@ interface ParsedLLMResponse {
     explanation: string;
 }
 
-async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMResponse> {
+/**
+ * Parses the raw text response from a large language model into a structured format of
+ * file changes and a general explanation. This version is more robust, handling multiple
+ * code languages and flexible formatting, including responses that start directly with a code block.
+ * @param llmResponse The raw string response from the LLM.
+ * @returns A promise that resolves to a ParsedLLMResponse object.
+ */
+export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMResponse> {
     const fileChanges: ProposedFileChange[] = [];
     let explanation = '';
     const lines = llmResponse.split('\n');
@@ -1515,76 +819,104 @@ async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMResponse>
     let inCodeBlock = false;
     let parsingExplanation = false;
 
+    // These markers are expected from the LLM
     const startFileMarker = '--- START FILE: ';
     const endFileMarker = '--- END FILE: ';
-    const codeBlockStart = '```csharp'; // Assuming C#
-    const codeBlockEnd = '```';
     const explanationStart = 'Explanation:';
+
+    // A more flexible regex to find the start of a code block for any language
+    const codeBlockStartRegex = /^\s*```(csharp|sql|py|ts)\s*$/i;
+    const codeBlockEndRegex = /^\s*```\s*$/;
 
     for (const line of lines) {
         if (line.startsWith(startFileMarker)) {
-            if (inCodeBlock && currentFilePath) {
-                // If we were in a code block and hit a new file marker, save the previous one
+            // A new file marker was found. If we were previously parsing a file, save it.
+            if (currentFilePath !== null && currentContent.length > 0) {
                 fileChanges.push({
                     filePath: currentFilePath,
-                    content: currentContent.join('\n'),
-                    isNewFile: true // Assume new for now, will differentiate later
+                    content: currentContent.join('\n').trim(),
+                    isNewFile: false
                 });
             }
-            currentFilePath = line.substring(startFileMarker.length, line.indexOf(' ---', startFileMarker.length)).trim();
+            
+            currentFilePath = line.substring(startFileMarker.length).trim();
+            // Remove the trailing ' ---' if it exists.
+            if (currentFilePath.endsWith(' ---')) {
+                currentFilePath = currentFilePath.substring(0, currentFilePath.length - 4).trim();
+            }
+
             currentContent = [];
-            inCodeBlock = false; // Reset code block flag
-            parsingExplanation = false; // Stop parsing explanation if a new file starts
+            inCodeBlock = false; // Reset flags for the new file
+            parsingExplanation = false; 
         } else if (line.startsWith(endFileMarker)) {
-            if (currentFilePath && currentContent.length > 0) {
+            // End of a file marker. Save the content.
+            if (currentFilePath !== null && currentContent.length > 0) {
                 fileChanges.push({
                     filePath: currentFilePath,
-                    content: currentContent.join('\n'),
-                    isNewFile: false // Will determine this later by checking if file exists
+                    content: currentContent.join('\n').trim(),
+                    isNewFile: false
                 });
             }
-            currentFilePath = null;
+            currentFilePath = null; // Clear the current file path
             currentContent = [];
-            inCodeBlock = false; // Ensure we are out of code block
-        } else if (line.trim() === codeBlockStart.trim()) {
+            inCodeBlock = false; // Ensure we are out of a code block
+        } else if (codeBlockStartRegex.test(line)) {
+            // Found a code block start. Start collecting content.
+            if (currentFilePath === null) {
+                // If we hit a code block without a file marker, assume it's for a single, untitled file.
+                currentFilePath = "Untitled-Code-Block";
+            }
             inCodeBlock = true;
-        } else if (line.trim() === codeBlockEnd.trim()) {
+        } else if (codeBlockEndRegex.test(line)) {
+            // Found a code block end. Stop collecting content.
             inCodeBlock = false;
         } else if (line.startsWith(explanationStart)) {
+            // Found the start of the explanation block
             parsingExplanation = true;
             explanation = line.substring(explanationStart.length).trim() + '\n';
+            // Stop parsing file content if explanation begins
+            currentFilePath = null;
         } else if (parsingExplanation) {
+            // Append lines to the explanation
             explanation += line + '\n';
         } else if (inCodeBlock && currentFilePath !== null) {
+            // Collect code block content
             currentContent.push(line);
         }
     }
 
-    // A final check in case the LLM doesn't end with --- END FILE ---
-    if (currentFilePath && currentContent.length > 0) {
+    // Final check for any remaining content if parsing ended abruptly
+    if (currentFilePath !== null && currentContent.length > 0) {
         fileChanges.push({
             filePath: currentFilePath,
-            content: currentContent.join('\n'),
-            isNewFile: false // Default to false, check real file system later
+            content: currentContent.join('\n').trim(),
+            isNewFile: false
         });
     }
 
-    // Now, determine isNewFile based on actual file existence
+    // Now, determine `isNewFile` based on actual file existence using a robust method
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (workspaceFolders && workspaceFolders.length > 0) {
         const rootPath = workspaceFolders[0].uri.fsPath;
         for (const change of fileChanges) {
             const fullPath = path.join(rootPath, change.filePath);
-            const fileExists = vscode.workspace.fs.stat(vscode.Uri.file(fullPath)).then(
-                () => true,
-                (err) => err.code === 'FileNotFound' ? false : true // Treat other errors as file existing for safety
-            );
-            change.isNewFile = !(await fileExists); // Mark as new if it doesn't exist
+            const fileUri = vscode.Uri.file(fullPath);
+
+            try {
+                // Use await to check for file existence
+                await vscode.workspace.fs.stat(fileUri);
+                // If stat succeeds, the file exists
+                change.isNewFile = false;
+            } catch (err: any) {
+                // If stat throws an error, the file doesn't exist
+                change.isNewFile = true;
+            }
         }
     }
     
     return { fileChanges, explanation: explanation.trim() };
 }
+
 
 
 async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
