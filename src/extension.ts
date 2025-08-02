@@ -1,7 +1,5 @@
-// src/extension.ts
 import * as vscode from 'vscode';
-import * as path from 'path'; // Import the 'path' module
-import fetch from 'node-fetch';
+import * as path from 'path';
 import pLimit from 'p-limit';
 
 import { CodeGraph,  INode, IEdge } from './graphTypes'; 
@@ -239,7 +237,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         let contextForLLM = `// Relevant code context for "${query}"\n\n`;
         let snippetCount = 0;
-        const maxSnippets = 5; // Limit the number of snippets for LLM prompt size
+        const maxSnippets = 10; // Limit the number of snippets for LLM prompt size
 
         for (const node of relevantNodes) {
             if (snippetCount >= maxSnippets) {break;}
@@ -628,11 +626,6 @@ function createStoryPrompt(userStory: string, relevantFileContents: Map<string, 
 }
 
 
-async function displayLLMResponseAsNewFile(llmResponse: string) {
-    const doc = await vscode.workspace.openTextDocument({ content: llmResponse, language: 'markdown' });
-    await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
-}
-
 async function callLLM(prompt: string, apiKey: string): Promise<string> {
 
 
@@ -667,10 +660,6 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
         codeViewPanel.reveal(vscode.ViewColumn.Beside);
         return;
     }
-
-    // *** THIS IS THE CRITICAL PART ***
-    // codeViewPanel is assigned here. After this line, within this function,
-    // TypeScript knows it's no longer undefined.
     codeViewPanel = vscode.window.createWebviewPanel(
         'saralFlowGenerator', // type
         'SaralFlow Code Generator', // title
@@ -738,7 +727,6 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
     }, null, extensionContext.subscriptions);
 }
 
-// Helper to get the HTML content for the Webview
 function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     // Local path to main script run in the webview
     const scriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'main.js');
@@ -750,6 +738,10 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     const markedUri = webview.asWebviewUri(markedScriptPathOnDisk);
     const styleUri = webview.asWebviewUri(stylePathOnDisk);
 
+    // Prism.js URIs for syntax highlighting
+    const prismCssUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism.css'));
+    const prismJsUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism.js'));
+   
     // Use a nonce to only allow a specific script to be run.
     const nonce = getNonce();
 
@@ -760,6 +752,8 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
                 <link href="${styleUri}" rel="stylesheet">
+                <!-- Add Prism.js CSS for a dark theme -->
+                <link href="${prismCssUri}" rel="stylesheet">
                 <title>SaralFlow Code Generator</title>
             </head>
             <body>
@@ -770,16 +764,16 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
                 <button id="generateButton">Generate Code</button>
                 <hr>
                 <h2>Proposed Code Change:</h2>
-                <!-- CRITICAL CHANGE: Removed the inline style and added a 'hidden' class. -->
                 <div id="loadingMessage" class="hidden">Generating Code Changes... Please wait.</div>
                 <div id="result"></div>
-
+                
                 <script nonce="${nonce}" src="${markedUri}"></script>
+                <!-- Add Prism.js script to enable highlighting -->
+                <script nonce="${nonce}" src="${prismJsUri}"></script>
                 <script nonce="${nonce}" src="${scriptUri}"></script>
             </body>
             </html>`;
 }
-
 
 // Utility to generate a nonce for Content Security Policy
 function getNonce() {

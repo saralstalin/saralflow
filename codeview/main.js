@@ -1,5 +1,3 @@
-// media/main.js
-
 console.log('main.js loaded.');
 
 const vscode = acquireVsCodeApi();
@@ -9,128 +7,111 @@ const generateButton = document.getElementById('generateButton');
 const resultDiv = document.getElementById('result');
 const loadingMessage = document.getElementById('loadingMessage');
 
-// Ensure all DOM elements are found
-console.log('DOM Elements check:');
-console.log('userStoryTextArea:', userStoryTextArea);
-console.log('generateButton:', generateButton);
-console.log('resultDiv:', resultDiv);
-console.log('loadingMessage:', loadingMessage);
-
 // New "Apply All" button
 const applyAllButton = document.createElement('button');
 applyAllButton.id = 'applyAllButton';
 applyAllButton.textContent = 'Apply All Changes';
 applyAllButton.style.display = 'none'; // Initially hidden
 
-console.log('applyAllButton created:', applyAllButton);
-
-// Add applyAllButton to the DOM only if resultDiv exists, as a safe measure
+// Add applyAllButton to the DOM only if resultDiv exists
 if (resultDiv) {
-    resultDiv.after(applyAllButton); // Insert after resultDiv for better layout
-    console.log('applyAllButton appended to DOM.');
+    resultDiv.after(applyAllButton);
 } else {
-    console.warn('Could not find resultDiv to append applyAllButton after it.');
-    document.body.appendChild(applyAllButton); // Fallback to append to body
+    document.body.appendChild(applyAllButton); // Fallback
 }
 
-
 applyAllButton.addEventListener('click', () => {
-    console.log('Apply All Changes button clicked.');
     vscode.postMessage({ command: 'applyAllChanges' });
 });
 
-
 generateButton.addEventListener('click', () => {
-    console.log('Generate Code button clicked.');
     const userStory = userStoryTextArea.value;
-    if (userStory.trim()) {
-        console.log('User story is not empty. Sending generateCode command.');
-        applyAllButton.style.display = 'none'; // Hide apply button on new generation
-        vscode.postMessage({
-            command: 'generateCode',
-            text: userStory
-        });
-    } else {
-        console.warn('User story is empty. Displaying warning.');
-        resultDiv.innerHTML = '<p style="color: red;">Please enter a user story.</p>';
+    if (userStory) {
+        // Clear previous results and show loading message
+        resultDiv.innerHTML = '';
+        loadingMessage.classList.remove('hidden');
+        applyAllButton.style.display = 'none';
+        vscode.postMessage({ command: 'generateCode', text: userStory });
     }
 });
 
-// Handle messages sent from the extension to the webview
+// Helper function to get the language class from a file path
+function getLanguageFromPath(filePath) {
+    const extension = filePath.split('.').pop().toLowerCase();
+    switch (extension) {
+        case 'ts':
+            return 'typescript';
+        case 'js':
+            return 'javascript';
+        case 'html':
+            return 'html';
+        case 'css':
+            return 'css';
+        case 'sql':
+            return 'sql';
+        case 'json':
+            return 'json';
+        case 'md':
+            return 'markdown';
+        default:
+            return 'clike'; // A generic fallback for Prism.js
+    }
+}
+
+// Listen for messages from the extension
 window.addEventListener('message', event => {
-    console.log('Message received from extension:', event.data);
-    const message = event.data; // The JSON data from the extension.
-
+    const message = event.data;
     switch (message.command) {
-        case 'displayParsedResult': // New command to display structured data
+        // Correctly handle the message structure for 'displayParsedResult'
+        case 'displayParsedResult':
             console.log('Command: displayParsedResult');
-            resultDiv.innerHTML = ''; // Clear previous results
-            const fileChanges = message.fileChanges;
-            const explanation = message.explanation;
+            const { explanation, fileChanges } = message;
 
-            console.log('Received fileChanges:', fileChanges);
-            console.log('Received explanation:', explanation);
+            resultDiv.innerHTML = ''; // Clear previous content
 
-            if (fileChanges && fileChanges.length > 0) {
-                console.log('fileChanges array is not empty. Rendering file changes.');
-                resultDiv.innerHTML += '<h3>Proposed File Changes:</h3>';
-                fileChanges.forEach((change, index) => {
-                    console.log(`Rendering change ${index}:`, change);
-                    const fileType = change.isNewFile ? 'New File' : 'Modified File';
-                    resultDiv.innerHTML += `<h4>${fileType}: <code>${escapeHtml(change.filePath)}</code></h4>`;
-                    resultDiv.innerHTML += `<pre><code class="csharp">${escapeHtml(change.content)}</code></pre>`; // Use escapeHtml for raw code
+            // Display the overall explanation
+            if (explanation) {
+                const explanationPara = document.createElement('p');
+                // Use marked.parse to render markdown in the explanation
+                explanationPara.innerHTML = marked.parse(explanation);
+                resultDiv.appendChild(explanationPara);
+            }
+
+            // Loop through each file change and display it
+            if (fileChanges && Array.isArray(fileChanges)) {
+                fileChanges.forEach(change => {
+                    const fileHeader = document.createElement('h3');
+                    fileHeader.textContent = (change.isNewFile ? 'New File' : 'Modified File') + ': ' + change.filePath;
+                    resultDiv.appendChild(fileHeader);
+
+                    const codeContainer = document.createElement('pre');
+                    const codeBlock = document.createElement('code');
+                    
+                    // Add the language class for Prism.js to apply highlighting
+                    const language = getLanguageFromPath(change.filePath);
+                    codeBlock.classList.add(`language-${language}`);
+                    
+                    // Use textContent to safely insert the code and prevent XSS
+                    codeBlock.textContent = change.content;
+
+                    codeContainer.appendChild(codeBlock);
+                    resultDiv.appendChild(codeContainer);
                 });
-                resultDiv.innerHTML += `<hr><h3>Explanation:</h3>`;
-                
-                // Test marked.js
-                console.log('Checking marked.parse availability:', typeof marked);
-                if (typeof marked !== 'undefined' && marked.parse) {
-                    const parsedExplanation = marked.parse(explanation);
-                    console.log('Parsed explanation HTML:', parsedExplanation);
-                    resultDiv.innerHTML += parsedExplanation; // Render explanation as markdown
-                } else {
-                    console.error('marked.parse is not available! Displaying raw explanation.');
-                    resultDiv.innerHTML += `<pre>${escapeHtml(explanation)}</pre>`;
-                }
-
-                applyAllButton.style.display = 'block'; // Show apply button
-                console.log('applyAllButton displayed.');
-            } else {
-                console.log('fileChanges array is empty or null. Displaying only explanation.');
-                // Test marked.js for explanation only path
-                console.log('Checking marked.parse availability (else block):', typeof marked);
-                if (typeof marked !== 'undefined' && marked.parse) {
-                    const parsedExplanation = marked.parse(explanation);
-                    console.log('Parsed explanation HTML (else block):', parsedExplanation);
-                    resultDiv.innerHTML += '<p>No specific file changes proposed. <br>' + parsedExplanation + '</p>';
-                } else {
-                    console.error('marked.parse is not available (else block)! Displaying raw explanation.');
-                    resultDiv.innerHTML += '<p>No specific file changes proposed. <br>' + escapeHtml(explanation) + '</p>';
-                }
-                applyAllButton.style.display = 'none';
             }
-            break; // Crucial 'break' here!
 
-        case 'displayResult': // Old command, just in case it's still sent
-            console.log('Command: displayResult (OLD COMMAND)');
-            // Check marked.js here too, for safety
-            if (typeof marked !== 'undefined' && marked.parse) {
-                 resultDiv.innerHTML = marked.parse(message.text);
-            } else {
-                console.error('marked.parse not available for displayResult!');
-                resultDiv.innerHTML = `<pre>${escapeHtml(message.text)}</pre>`;
-            }
+            // Highlight all code blocks after they have been added to the DOM
+            Prism.highlightAll();
+            applyAllButton.style.display = 'block';
             break;
-
         case 'showLoading':
             console.log('Command: showLoading');
-            if (loadingMessage) {loadingMessage.classList.remove('hidden');};
+            loadingMessage.classList.remove('hidden');
             resultDiv.innerHTML = '';
             applyAllButton.style.display = 'none';
             break;
         case 'hideLoading':
             console.log('Command: hideLoading');
-            if (loadingMessage) {loadingMessage.classList.add('hidden');};
+            loadingMessage.classList.add('hidden');
             break;
         case 'showError':
             console.log('Command: showError', message.text);
@@ -150,7 +131,6 @@ window.addEventListener('message', event => {
 
 // Helper function to escape HTML for displaying raw code safely
 function escapeHtml(unsafe) {
-    // console.log('Escaping HTML for:', unsafe); // Can be very chatty for large code blocks
     return unsafe
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
@@ -158,11 +138,3 @@ function escapeHtml(unsafe) {
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
 }
-
-// Final check for marked.js availability on load
-window.onload = () => {
-    console.log('Webview window loaded. Final marked.js check:', typeof marked);
-    if (typeof marked === 'undefined') {
-        console.error('ERROR: marked.js is NOT globally available. Check script loading in HTML and CSP.');
-    }
-};
