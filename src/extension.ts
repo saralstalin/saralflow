@@ -766,8 +766,11 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
                 <br>
                 <button id="generateButton">Generate Code</button>
                 <hr>
+                <div id="loadingMessage" class="hidden">
+                    <div class="loading-spinner"></div>
+                    <p>Generating Code Changes... Please wait.</p>
+                </div>
                 <h2>Proposed Code Change:</h2>
-                <div id="loadingMessage" class="hidden">Generating Code Changes... Please wait.</div>
                 <div id="result"></div>
                 
                 <script nonce="${nonce}" src="${markedUri}"></script>
