@@ -709,10 +709,18 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                     
                     break; // Use break, not return, if you have more cases after this
                 case 'applyAllChanges':
-                    if (lastProposedChanges.length > 0) {
-                        await applyCodeChanges(lastProposedChanges);
+                        if (lastProposedChanges.length > 0) {
+                            await applyCodeChanges(lastProposedChanges);
+                        } else {
+                            vscode.window.showWarningMessage('No proposed changes to apply.');
+                        }
+                        break;
+                case 'applySelectedChanges':
+                    const selectedChanges = message.changes as ProposedFileChange[];
+                    if (selectedChanges && selectedChanges.length > 0) {
+                        await applyCodeChanges(selectedChanges);
                     } else {
-                        vscode.window.showWarningMessage('No proposed changes to apply.');
+                        vscode.window.showWarningMessage('No selected changes to apply.');
                     }
                     break;
             }
@@ -913,6 +921,7 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
     return { fileChanges, explanation: explanation.trim() };
 }
 
+// This is the unified function to apply code changes using diff-match-patch
 async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders || workspaceFolders.length === 0) {
@@ -920,7 +929,7 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
         return;
     }
     const rootPath = workspaceFolders[0].uri.fsPath;
-    const dmp = new DiffMatchPatch(); // Try this first
+    const dmp = new DiffMatchPatch();
 
     const edit = new vscode.WorkspaceEdit();
     let filesOpenedCount = 0;
@@ -948,7 +957,6 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
                     const type = diff[0]; // -1: deletion, 0: equality, 1: insertion
                     const text = diff[1];
 
-                    // --- CHANGE THESE LINES ---
                     if (type === 0) { // Equivalent to dmp.DIFF_EQUAL
                         currentOffset += text.length;
                     } else if (type === 1) { // Equivalent to dmp.DIFF_INSERT

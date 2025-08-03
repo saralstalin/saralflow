@@ -1,4 +1,3 @@
-* media/styles.css */
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     color: var(--vscode-editor-foreground);
@@ -17,7 +16,7 @@ textarea {
     color: var(--vscode-input-foreground);
     border-radius: 4px;
     resize: vertical;
-    box-sizing: border-box; /* Include padding and border in the element's total width and height */
+    box-sizing: border-box;
 }
 
 button {
@@ -40,24 +39,21 @@ button:hover {
     padding: 10px;
     border-radius: 4px;
     border: 1px solid var(--vscode-editorGroup-border);
-    white-space: pre-wrap; /* Preserve whitespace and wrap long lines */
-    word-wrap: break-word; /* Break long words */
-    overflow-x: auto; /* Allow horizontal scrolling for code blocks */
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow-x: auto;
 }
 
 #result pre {
-    background-color: var(--vscode-editorGroup-background); /* Darker background for code blocks */
+    background-color: var(--vscode-editorGroup-background);
     padding: 10px;
     border-radius: 4px;
-    border: 1px solid var(--vscode-input-border);
-}
-
-#result code {
+    overflow: auto;
     font-family: monospace;
-    color: var(--vscode-editor-foreground);
+    position: relative;
 }
 
-
+/* New CSS to handle the loading message being hidden */
 .hidden {
     display: none !important;
 }
@@ -86,4 +82,23 @@ button:hover {
     align-items: center;
     justify-content: center;
     margin-top: 20px;
+}
+
+/* Container for each file change */
+.file-change-container {
+    border: 1px solid var(--vscode-editorGroup-border);
+    border-radius: 4px;
+    padding: 10px;
+    margin-bottom: 20px;
+}
+
+/* Style for the checkbox and label */
+.file-change-container input[type="checkbox"] {
+    margin-right: 10px;
+}
+.file-change-container label {
+    font-size: 1.2em;
+    font-weight: bold;
+    color: var(--vscode-editor-foreground);
+    cursor: pointer;
 }
