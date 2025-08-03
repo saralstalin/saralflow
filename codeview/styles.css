@@ -16,7 +16,7 @@ textarea {
     color: var(--vscode-input-foreground);
     border-radius: 4px;
     resize: vertical;
-    box-sizing: border-box;
+    box-sizing: border-box; /* Include padding and border in the element's total width and height */
 }
 
 button {
@@ -33,46 +33,68 @@ button:hover {
     background-color: var(--vscode-button-hoverBackground);
 }
 
-/* Style for markdown content */
+/* Style for markdown content and file changes */
 #result {
     background-color: var(--vscode-editor-background);
     padding: 10px;
     border-radius: 4px;
     border: 1px solid var(--vscode-editorGroup-border);
+    white-space: pre-wrap; /* Preserve whitespace and wrap long lines */
+    word-wrap: break-word; /* Break long words */
+}
+
+/* Styling for the container of each file change */
+.file-change-container {
+    margin-bottom: 20px;
+    padding: 10px;
+    border: 1px solid var(--vscode-editorGroup-border);
+    border-radius: 4px;
+    background-color: var(--vscode-editor-background);
+}
+
+/* Style for the editable code div */
+.code-editable-div {
+    width: 100%;
+    min-height: 100px;
+    padding: 15px;
+    margin-top: 5px;
+    background-color: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid #333; /* Darker border for the contrast */
+    border-radius: 8px; /* Slightly more rounded corners */
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    resize: vertical;
+    box-sizing: border-box;
+    overflow-x: auto; /* Allow horizontal scrolling */
     white-space: pre-wrap;
     word-wrap: break-word;
-    overflow-x: auto;
+    box-shadow: inset 0 0 5px rgba(0, 0, 0, 0.5); /* A subtle inner shadow to add depth */
 }
 
-#result pre {
-    background-color: var(--vscode-editorGroup-background);
-    padding: 10px;
-    border-radius: 4px;
-    overflow: auto;
-    font-family: monospace;
-    position: relative;
+.code-editable-div:focus {
+    outline: 1px solid var(--vscode-focusBorder);
 }
 
-/* New CSS to handle the loading message being hidden */
-.hidden {
-    display: none !important;
-}
-
-/* Spinner for loading indicator */
+/* Style for the loading spinner */
 .loading-spinner {
     border: 4px solid var(--vscode-editorGroup-border);
     border-top: 4px solid var(--vscode-button-background);
     border-radius: 50%;
-    width: 30px;
-    height: 30px;
+    width: 20px;
+    height: 20px;
     animation: spin 1s linear infinite;
     margin: 10px auto;
 }
 
-/* Keyframe animation for the spinner */
 @keyframes spin {
     0% { transform: rotate(0deg); }
     100% { transform: rotate(360deg); }
+}
+
+.hidden {
+    display: none !important;
 }
 
 /* Centering the loading message content */
@@ -82,23 +104,4 @@ button:hover {
     align-items: center;
     justify-content: center;
     margin-top: 20px;
-}
-
-/* Container for each file change */
-.file-change-container {
-    border: 1px solid var(--vscode-editorGroup-border);
-    border-radius: 4px;
-    padding: 10px;
-    margin-bottom: 20px;
-}
-
-/* Style for the checkbox and label */
-.file-change-container input[type="checkbox"] {
-    margin-right: 10px;
-}
-.file-change-container label {
-    font-size: 1.2em;
-    font-weight: bold;
-    color: var(--vscode-editor-foreground);
-    cursor: pointer;
 }
