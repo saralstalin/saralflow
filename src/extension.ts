@@ -733,6 +733,7 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     const markedScriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'marked.min.js'); 
     const stylePathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'styles.css');
 
+
     // And the uri to the script and style for the webview
     const scriptUri = webview.asWebviewUri(scriptPathOnDisk);
     const markedUri = webview.asWebviewUri(markedScriptPathOnDisk);
@@ -741,6 +742,8 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     // Prism.js URIs for syntax highlighting
     const prismCssUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism.css'));
     const prismJsUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism.js'));
+    const prismSQLUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism-sql.min.js'));
+    const prismCsharpUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism-csharp.min.js'));
    
     // Use a nonce to only allow a specific script to be run.
     const nonce = getNonce();
@@ -770,6 +773,8 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
                 <script nonce="${nonce}" src="${markedUri}"></script>
                 <!-- Add Prism.js script to enable highlighting -->
                 <script nonce="${nonce}" src="${prismJsUri}"></script>
+                <script nonce="${nonce}" src="${prismSQLUri}"></script>
+                <script nonce="${nonce}" src="${prismCsharpUri}"></script>
                 <script nonce="${nonce}" src="${scriptUri}"></script>
             </body>
             </html>`;
@@ -798,11 +803,12 @@ interface ParsedLLMResponse {
 }
 
 /**
- * Parses the raw text response from a large language model into a structured format of
- * file changes and a general explanation. This version is more robust, handling multiple
- * code languages and flexible formatting, including responses that start directly with a code block.
+ * Parses the LLM response into structured changes and a final explanation.
+ * This version is corrected to handle file markers and content directly,
+ * without relying on markdown code blocks.
+ *
  * @param llmResponse The raw string response from the LLM.
- * @returns A promise that resolves to a ParsedLLMResponse object.
+ * @returns A promise that resolves to the parsed LLM response.
  */
 export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMResponse> {
     const fileChanges: ProposedFileChange[] = [];
@@ -810,22 +816,25 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
     const lines = llmResponse.split('\n');
     let currentFilePath: string | null = null;
     let currentContent: string[] = [];
-    let inCodeBlock = false;
     let parsingExplanation = false;
 
     // These markers are expected from the LLM
     const startFileMarker = '--- START FILE: ';
     const endFileMarker = '--- END FILE: ';
     const explanationStart = 'Explanation:';
-
-    // A more flexible regex to find the start of a code block for any language
-    const codeBlockStartRegex = /^\s*```(csharp|sql|py|ts)\s*$/i;
-    const codeBlockEndRegex = /^\s*```\s*$/;
+    const codeBlockRegex = /^\s*```.*/;
 
     for (const line of lines) {
-        if (line.startsWith(startFileMarker)) {
+        const trimmedLine = line.trim();
+
+        // Skip lines that are just code block markers
+        if (codeBlockRegex.test(trimmedLine)) {
+            continue;
+        }
+
+        if (trimmedLine.startsWith(startFileMarker)) {
             // A new file marker was found. If we were previously parsing a file, save it.
-            if (currentFilePath !== null && currentContent.length > 0) {
+            if (currentFilePath !== null) {
                 fileChanges.push({
                     filePath: currentFilePath,
                     content: currentContent.join('\n').trim(),
@@ -833,18 +842,18 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
                 });
             }
             
-            currentFilePath = line.substring(startFileMarker.length).trim();
+            // Start parsing the new file
+            currentFilePath = trimmedLine.substring(startFileMarker.length).trim();
             // Remove the trailing ' ---' if it exists.
             if (currentFilePath.endsWith(' ---')) {
                 currentFilePath = currentFilePath.substring(0, currentFilePath.length - 4).trim();
             }
 
             currentContent = [];
-            inCodeBlock = false; // Reset flags for the new file
             parsingExplanation = false; 
-        } else if (line.startsWith(endFileMarker)) {
+        } else if (trimmedLine.startsWith(endFileMarker)) {
             // End of a file marker. Save the content.
-            if (currentFilePath !== null && currentContent.length > 0) {
+            if (currentFilePath !== null) {
                 fileChanges.push({
                     filePath: currentFilePath,
                     content: currentContent.join('\n').trim(),
@@ -853,28 +862,18 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
             }
             currentFilePath = null; // Clear the current file path
             currentContent = [];
-            inCodeBlock = false; // Ensure we are out of a code block
-        } else if (codeBlockStartRegex.test(line)) {
-            // Found a code block start. Start collecting content.
-            if (currentFilePath === null) {
-                // If we hit a code block without a file marker, assume it's for a single, untitled file.
-                currentFilePath = "Untitled-Code-Block";
-            }
-            inCodeBlock = true;
-        } else if (codeBlockEndRegex.test(line)) {
-            // Found a code block end. Stop collecting content.
-            inCodeBlock = false;
-        } else if (line.startsWith(explanationStart)) {
+        } else if (trimmedLine.startsWith(explanationStart)) {
             // Found the start of the explanation block
             parsingExplanation = true;
-            explanation = line.substring(explanationStart.length).trim() + '\n';
+            explanation = trimmedLine.substring(explanationStart.length).trim() + '\n';
             // Stop parsing file content if explanation begins
             currentFilePath = null;
+            currentContent = [];
         } else if (parsingExplanation) {
             // Append lines to the explanation
             explanation += line + '\n';
-        } else if (inCodeBlock && currentFilePath !== null) {
-            // Collect code block content
+        } else if (currentFilePath !== null) {
+            // Collect file content
             currentContent.push(line);
         }
     }
@@ -910,8 +909,6 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
     
     return { fileChanges, explanation: explanation.trim() };
 }
-
-
 
 async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
     const workspaceFolders = vscode.workspace.workspaceFolders;

@@ -51,6 +51,8 @@ function getLanguageFromPath(filePath) {
             return 'sql';
         case 'json':
             return 'json';
+        case 'cs': 
+            return 'csharp';
         case 'md':
             return 'markdown';
         default:
