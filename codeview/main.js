@@ -7,38 +7,18 @@ const generateButton = document.getElementById('generateButton');
 const resultDiv = document.getElementById('result');
 const loadingMessage = document.getElementById('loadingMessage');
 
-// New "Apply All" and "Apply Selected" buttons
-const applyAllButton = document.createElement('button');
-applyAllButton.id = 'applyAllButton';
-applyAllButton.textContent = 'Apply All Changes';
-applyAllButton.style.display = 'none'; // Initially hidden
 
 const applySelectedButton = document.createElement('button');
 applySelectedButton.id = 'applySelectedButton';
-applySelectedButton.textContent = 'Apply Selected Changes';
+applySelectedButton.textContent = 'Apply Changes';
 applySelectedButton.style.display = 'none'; // Initially hidden
 
 // Add both buttons to the DOM
 if (resultDiv) {
     resultDiv.after(applySelectedButton);
-    resultDiv.after(applyAllButton);
 } else {
-    document.body.appendChild(applyAllButton); // Fallback
     document.body.appendChild(applySelectedButton);
 }
-
-
-applyAllButton.addEventListener('click', () => {
-    console.log('Apply All Changes button clicked.');
-    const allChanges = [];
-    document.querySelectorAll('.file-change-container').forEach(container => {
-        const filePath = container.querySelector('input[type="checkbox"]').dataset.filePath;
-        const editedContent = container.querySelector('.code-editable-div').textContent;
-        const isNewFile = container.querySelector('label').textContent.includes('(New File)');
-        allChanges.push({ filePath, content: editedContent, isNewFile });
-    });
-    vscode.postMessage({ command: 'applyAllChanges', changes: allChanges });
-});
 
 
 applySelectedButton.addEventListener('click', () => {
@@ -64,7 +44,6 @@ generateButton.addEventListener('click', () => {
         // Clear previous results and show loading message
         resultDiv.innerHTML = '';
         loadingMessage.classList.remove('hidden');
-        applyAllButton.style.display = 'none';
         applySelectedButton.style.display = 'none';
         vscode.postMessage({ command: 'generateCode', text: userStory });
     }
@@ -105,7 +84,6 @@ window.addEventListener('message', event => {
         case 'showLoading':
             loadingMessage.classList.remove('hidden');
             resultDiv.innerHTML = '';
-            applyAllButton.style.display = 'none';
             applySelectedButton.style.display = 'none';
             break;
         case 'hideLoading':
@@ -113,12 +91,10 @@ window.addEventListener('message', event => {
             break;
         case 'showError':
             resultDiv.innerHTML = `<p style="color: red;">${escapeHtml(message.text)}</p>`;
-            applyAllButton.style.display = 'none';
             applySelectedButton.style.display = 'none';
             break;
         case 'clearResults':
             resultDiv.innerHTML = '';
-            applyAllButton.style.display = 'none';
             applySelectedButton.style.display = 'none';
             break;
         default:
@@ -144,7 +120,6 @@ function displayParsedResult(explanation, fileChanges) {
 
     // Clear previous results
     resultDiv.innerHTML = '';
-    applyAllButton.style.display = 'block';
     applySelectedButton.style.display = 'block';
 
     if (explanation) {

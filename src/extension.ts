@@ -603,7 +603,7 @@ function createStoryPrompt(userStory: string, relevantFileContents: Map<string, 
 
     prompt += "--- Proposed Changes ---\n\n";
     prompt += "For each file to be created or modified, provide its full relative path and its complete, modified content within a C# markdown block. Use `--- START FILE: <relative/path/to/file.cs> ---` and `--- END FILE: <relative/path/to/file.cs> ---` markers.\n";
-    prompt += "After all file changes, provide a clear 'Explanation:' section detailing the overall approach and how the user can apply the changes using the interactive webview. For example, explain that the user can edit the code directly and use the 'Apply' buttons.\n\n";
+    prompt += "After all file changes, provide a clear 'Explanation:' section detailing the overall approach and how the user can apply the changes using the interactive webview. For example, explain that the user can edit the code directly and use the 'Apply Changes' button.\n\n";
 
     prompt += "Example Output Format:\n\n";
     prompt += "```\n";
@@ -620,7 +620,7 @@ function createStoryPrompt(userStory: string, relevantFileContents: Map<string, 
     prompt += "```\n";
     prompt += "--- END FILE: src/Existing/ExistingController.cs ---\n\n";
     prompt += "Explanation:\n";
-    prompt += "These changes are designed to work with the interactive webview. Once you have made any necessary edits to the code directly in the provided text areas, you can use the 'Apply All Changes' or 'Apply Selected Changes' buttons to apply the modifications directly to your workspace.\n\n";
+    prompt += "These changes are designed to work with the interactive webview. Once you have made any necessary edits to the code directly in the provided text areas, you can use the 'Apply Changes' button to apply the modifications directly to your workspace.\n\n";
 
     return prompt;
 }
@@ -708,13 +708,6 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                     }
                     
                     break; // Use break, not return, if you have more cases after this
-                case 'applyAllChanges':
-                        if (lastProposedChanges.length > 0) {
-                            await applyCodeChanges(lastProposedChanges);
-                        } else {
-                            vscode.window.showWarningMessage('No proposed changes to apply.');
-                        }
-                        break;
                 case 'applySelectedChanges':
                     const selectedChanges = message.changes as ProposedFileChange[];
                     if (selectedChanges && selectedChanges.length > 0) {
@@ -991,7 +984,7 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
     if (success) {
         vscode.window.showInformationMessage('SaralFlow: Code changes applied successfully!');
         // Optional: Open all modified/new files in editor
-        for (const change of changesToApply) {
+        /*for (const change of changesToApply) {
             const fullPath = path.join(rootPath, change.filePath);
             const fileUri = vscode.Uri.file(fullPath);
             try {
@@ -1000,7 +993,7 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
             } catch (e) {
                 console.warn(`Could not open file ${change.filePath}: ${e}`);
             }
-        }
+        }*/
     } else {
         vscode.window.showErrorMessage('SaralFlow: Failed to apply code changes.');
     }
