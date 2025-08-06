@@ -1,16 +1,17 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import pLimit from 'p-limit';
 
 import { CodeGraph,  INode, IEdge } from './graphTypes'; 
-import { getEmbedding, cosineSimilarity } from'./embeddingService';
-import {extractSemanticGraph, rebuildFileReferences, processFileAndAddToGraph, removeFileNodesFromGraph, rebuildAffectedReferences} from './graphBuilder';
+import { getEmbeddingViaCloudFunction, cosineSimilarity } from'./embeddingService';
+import {extractSemanticGraph,  processFileAndAddToGraph, removeFileNodesFromGraph, rebuildAffectedReferences, reEmbedGraphNodes} from './graphBuilder';
+const config = vscode.workspace.getConfiguration('saralflow');
 
+const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeUrl') 
+                                     || 'https://us-central1-saralflowapis.cloudfunctions.net/generateCode';
 
 const DiffMatchPatch: any = require('diff-match-patch'); 
 // Keep track of the last parsed changes to apply them
 let lastProposedChanges: ProposedFileChange[] = [];
-const limit = pLimit(10);
 let currentGraph: CodeGraph = new CodeGraph(); // Our in-memory graph instance
 // Declare panel globally so it can be reused or disposed
 let graphPanel: vscode.WebviewPanel | undefined = undefined;
@@ -19,44 +20,24 @@ let codeViewPanel: vscode.WebviewPanel | undefined = undefined;
 
 let extensionContext: vscode.ExtensionContext;
 
-// Define the structure for the embedding API response
-interface EmbeddingResponse {
-    data: { embedding: number[] }[];
-    // Other fields might be present depending on the API
-}
 
 // Global variable to store the built graph
 export let semanticGraph: CodeGraph = new CodeGraph();
 let isGraphBuilding = false;
 
-// IMPORTANT: Replace with your actual OpenAI API key for chat completions
-// For a production extension, store this securely in VS Code settings.
-const OPENAI_CHAT_API_KEY = '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';
+// Global variable to store the Firebase ID Token received from the webview
+export let firebaseIdToken: string | null = null;
 
-// IMPORTANT: Replace with your actual OpenAI API key for embeddings (can be the same as chat)
-const OPENAI_EMBEDDING_API_KEY = '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';
-
-// Function to retrieve the API Key
-export function getApiKey(): string {
-  const apiKey = OPENAI_EMBEDDING_API_KEY;
-  return apiKey;
+// Define the expected structure of the Cloud Function's response for generateCode
+interface GenerateCodeResponse {
+    success: boolean;
+    text?: string; // Content for successful code generation
+    error?: string; // Error message if success is false
 }
-
-// Global variable to store the embedded schema chunks for the current workspace
-// This will act as our in-memory vector store.
-let cachedSchemaChunks: { text: string, embedding: number[] }[] = [];
-let isSchemaLoading = false; // Flag to prevent concurrent loading
-
-// Global variable to store the resolved base URI for SQL files (e.g., the 'dbo' folder)
-let sqlFilesBaseUri: vscode.Uri | undefined;
-
 
 export function activate(context: vscode.ExtensionContext) {
     extensionContext = context;
 
-    
-
-    
     // *** Initial Graph Building on Activation ***
     let buildGraphDisposable = vscode.commands.registerCommand('SaralFlow.buildGraphOnStartup', async () => {
         if (isGraphBuilding) {
@@ -363,15 +344,24 @@ export function deactivate() {
     // (This is implicitly handled by context.subscriptions.push(sqlWatcher) in activate)
 }
 
-// New or modified querySemanticGraph function
+
 async function querySemanticGraph(queryText: string, maxDepth: number = 2, similarityThreshold: number = 0.7): Promise<INode[]> {
     const lowerCaseQuery = queryText.toLowerCase();
     const visitedNodes = new Set<string>();
     const relevantNodes: INode[] = [];
     const queue: { nodeId: string, depth: number }[] = [];
 
-    // --- Get embedding for the query text ---
-    const queryEmbedding = await getEmbedding(queryText, OPENAI_EMBEDDING_API_KEY);
+    // --- Get embedding for the query text using the Cloud Function ---
+    if (!firebaseIdToken) {
+        vscode.window.showErrorMessage('SaralFlow: Firebase login required to query semantic graph (missing ID token).');
+        return [];
+    }
+    const queryEmbedding = await getEmbeddingViaCloudFunction(queryText, firebaseIdToken);
+
+    if (!queryEmbedding) {
+        vscode.window.showErrorMessage('SaralFlow: Failed to generate embedding for the query. Cannot perform semantic search.');
+        return [];
+    }
 
     // --- Phase 1: Semantic & Keyword Matching (Seed Nodes) ---
     console.log(`[SaralFlow Graph] Starting semantic and keyword matching for query "${queryText}".`);
@@ -461,8 +451,6 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
     return relevantNodes;
 }
 
-
-// NEW: Function to get code snippet from a node
 async function getCodeSnippet(node: INode): Promise<string> {
     if (!node.uri || !node.range) {
         return `// No code snippet available for ${node.label} (missing URI or range).\n`;
@@ -484,11 +472,22 @@ async function getCodeSnippet(node: INode): Promise<string> {
     }
 }
 
-
-// Updated proposeCodeFromStory to send result to webview
 async function proposeCodeFromStory(userStory: string) {
     if (!semanticGraph || !codeViewPanel) {
         vscode.window.showErrorMessage('SaralFlow: Graph not built or Webview not active.');
+        return;
+    }
+
+    if (!userStory) {
+        vscode.window.showErrorMessage('User story cannot be empty.');
+        codeViewPanel?.webview.postMessage({ command: 'showError', text: 'User story cannot be empty.' });
+        return;
+    }
+
+    // Ensure Firebase ID token is available
+    if (!firebaseIdToken) {
+        vscode.window.showErrorMessage('Please log in first.');
+        codeViewPanel?.webview.postMessage({ command: 'showError', text: 'Please log in first.' });
         return;
     }
 
@@ -496,14 +495,10 @@ async function proposeCodeFromStory(userStory: string) {
     codeViewPanel.webview.postMessage({ command: 'clearResults' }); // Clear previous results
 
     try {
-       
-        if (!OPENAI_CHAT_API_KEY) {
-            vscode.window.showErrorMessage('SaralFlow: API Key is required to call the LLM. Please set it first.');
-            codeViewPanel.webview.postMessage({ command: 'showError', text: 'API Key is required.' });
-            return;
-        }
+        let relevantFileContents: { filePath: string; content: string }[] = [];
 
-        const storyEmbedding = await getEmbedding(userStory, OPENAI_EMBEDDING_API_KEY);
+        // --- Use getEmbeddingViaCloudFunction for story embedding ---
+        const storyEmbedding = await getEmbeddingViaCloudFunction(userStory, firebaseIdToken);
 
         if (!storyEmbedding) {
             vscode.window.showErrorMessage('SaralFlow: Failed to generate embedding for the story. Please check your API key and try again.');
@@ -537,22 +532,46 @@ async function proposeCodeFromStory(userStory: string) {
             }
         }
 
-        const prompt = createStoryPrompt(userStory, fileContentsMap);
+        // Convert Map to an array of objects as expected by the Cloud Function
+        relevantFileContents = Array.from(fileContentsMap.entries()).map(([filePath, content]) => ({
+            filePath: filePath,
+            content: content
+        }));
 
-        const llmResponse = await callLLM(prompt, OPENAI_CHAT_API_KEY);
-
-        // Parse the LLM response into structured changes and the explanation
-        const { fileChanges, explanation } = await parseLLMResponse(llmResponse);
-        lastProposedChanges = fileChanges; // Store for application
-
-        // Send the result back to the webview
-        codeViewPanel.webview.postMessage({
-            command: 'displayParsedResult',
-            fileChanges: fileChanges,
-            explanation: explanation
+        const response = await fetch(generateCodeFunctionUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${firebaseIdToken}`
+            },
+            body: JSON.stringify({
+                userStory: userStory,
+                relevantFileContents: relevantFileContents
+            })
         });
 
-        vscode.window.showInformationMessage('SaralFlow: Code generation complete.');
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Cloud Function error: ${response.status} - ${errorText}`);
+        }
+
+        const result = await response.json() as GenerateCodeResponse; // Type assertion here
+
+        if (result.success && result.text) { // Now TypeScript knows 'success' and 'text' exist
+            // Extract the text from the response and then parse it
+            const llmResponseText = result.text;
+            const parsedResult = await parseLLMResponse(llmResponseText); // Pass the text content
+            lastProposedChanges = parsedResult.fileChanges;
+
+            codeViewPanel?.webview.postMessage({
+                command: 'displayParsedResult',
+                explanation: parsedResult.explanation,
+                fileChanges: parsedResult.fileChanges,
+            });
+        }
+        else {
+            throw new Error(result.error || 'Unknown error from Cloud Function.');
+        }
 
     } catch (error: any) {
         vscode.window.showErrorMessage(`SaralFlow: Failed to generate code: ${error.message}`);
@@ -585,75 +604,6 @@ function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
     return relevantNodes.slice(0, topN).map(r => r.node);
 }
 
-// Updated createStoryPrompt signature to accept the map
-function createStoryPrompt(userStory: string, relevantFileContents: Map<string, string>): string {
-    let prompt = "You are an expert software developer. Your task is to implement a new feature or change based on a user story and provided code context. Your response should contain markdown code blocks, each representing the *full content* of a file that needs to be created or modified. Use explicit markers for each file. After all code blocks, provide a brief markdown explanation of how to apply the changes.\n\n";
-
-    prompt += `**User Story:**\n${userStory}\n\n`;
-
-    if (relevantFileContents.size > 0) {
-        prompt += "**Relevant Code Context (Full File Contents):**\n";
-        for (const [filePath, content] of relevantFileContents.entries()) {
-            prompt += `--- Context File: ${filePath} ---\n`;
-            prompt += `\`\`\`code\n${content}\n\`\`\`\n\n`;
-        }
-    } else {
-        prompt += "No relevant code context could be found or provided.\n\n";
-    }
-
-    prompt += "--- Proposed Changes ---\n\n";
-    prompt += "For each file to be created or modified, provide its full relative path and its complete, modified content within a C# markdown block. Use `--- START FILE: <relative/path/to/file.cs> ---` and `--- END FILE: <relative/path/to/file.cs> ---` markers.\n";
-    prompt += "After all file changes, provide a clear 'Explanation:' section detailing the overall approach and how the user can apply the changes using the interactive webview. For example, explain that the user can edit the code directly and use the 'Apply Changes' button.\n\n";
-
-    prompt += "Example Output Format:\n\n";
-    prompt += "```\n";
-    prompt += "--- START FILE: src/NewFeature/NewService.cs ---\n";
-    prompt += "```csharp\n";
-    prompt += "// Full content of the new file\n";
-    prompt += "public class NewService { /* ... */ }\n";
-    prompt += "```\n";
-    prompt += "--- END FILE: src/NewFeature/NewService.cs ---\n\n";
-    prompt += "--- START FILE: src/Existing/ExistingController.cs ---\n";
-    prompt += "```csharp\n";
-    prompt += "// Full content of the existing file, with your modifications merged in\n";
-    prompt += "public class ExistingController { /* ... modified code ... */ }\n";
-    prompt += "```\n";
-    prompt += "--- END FILE: src/Existing/ExistingController.cs ---\n\n";
-    prompt += "Explanation:\n";
-    prompt += "These changes are designed to work with the interactive webview. Once you have made any necessary edits to the code directly in the provided text areas, you can use the 'Apply Changes' button to apply the modifications directly to your workspace.\n\n";
-
-    return prompt;
-}
-
-
-async function callLLM(prompt: string, apiKey: string): Promise<string> {
-
-
-    // Assuming you're using OpenAI's chat completion API
-    const { OpenAI } = require('openai'); // Make sure 'openai' is installed
-    const openai = new OpenAI({ apiKey: apiKey });
-
-    try {
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o-mini", // Or gpt-4, gpt-3.5-turbo, etc.
-            messages: [{
-                role: "system",
-                content: "You are an expert software developer. Your task is to propose a code change based on a user request and provided code context. Your response should be a markdown code block containing the proposed code, followed by a brief markdown explanation of the change."
-            }, {
-                role: "user",
-                content: prompt
-            }],
-            temperature: 0.1, // Keep it low for more deterministic code
-        });
-        
-        return response.choices[0]?.message?.content || "No response from LLM.";
-    } catch (error: any) {
-        throw new Error(`LLM API call failed: ${error.message}`);
-    }
-}
-
-
-// This function is responsible for creating and managing the webview panel
 function openSaralFlowWebview(extensionUri: vscode.Uri) {
     // If a panel already exists, just reveal it
     if (codeViewPanel) {
@@ -682,6 +632,12 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                 return; // Exit the function gracefully
             }
             switch (message.command) {
+                 case 'firebaseToken':
+                        firebaseIdToken = message.token;
+                        console.log('Firebase ID Token received by extension.');
+                        await reEmbedGraphNodes();
+                        break;
+
                 case 'generateCode':
                     // We need to ensure proposeCodeFromStory also handles codeViewPanel potentially being undefined
                     // if this callback gets invoked after the panel has been disposed.
@@ -745,6 +701,10 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     const prismJsUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism.js'));
     const prismSQLUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism-sql.min.js'));
     const prismCsharpUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism-csharp.min.js'));
+
+    // Firebase SDK URIs
+    const firebaseAppUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'firebase-app-compat.js'));
+    const firebaseAuthUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'firebase-auth-compat.js'));
    
     // Use a nonce to only allow a specific script to be run.
     const nonce = getNonce();
@@ -754,7 +714,7 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' https://www.gstatic.com; connect-src https://*.firebaseio.com https://*.firebaseauth.com https://securetoken.googleapis.com https://identitytoolkit.googleapis.com;">
                 <link href="${styleUri}" rel="stylesheet">
                 <!-- Add Prism.js CSS for a dark theme -->
                 <link href="${prismCssUri}" rel="stylesheet">
@@ -762,17 +722,30 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
             </head>
             <body>
                 <h1>SaralFlow: Story to Code</h1>
+                <div id="auth-section">
+                    <h2>Firebase Login</h2>
+                    <input type="email" id="emailInput" placeholder="Email" value="testuser@test.com" />
+                    <input type="password" id="passwordInput" placeholder="Password" value="test&test" />
+                    <button id="loginButton">Login</button>
+                    <p id="authStatus"></p>
+                </div>
+                <hr>
                 <p>Describe the feature or change you want to implement:</p>
                 <textarea id="userStory" rows="10" cols="60" placeholder="e.g., 'As a user, I want to add a new API endpoint that lists all products with a 'special' tag.'"></textarea>
                 <br>
                 <button id="generateButton">Generate Code</button>
                 <hr>
-                <div id="loadingMessage" class="hidden">
-                    <div class="loading-spinner"></div>
-                    <p>Generating Code Changes... Please wait.</p>
+                <div id="app-section" class="hidden">
+                    <div id="loadingMessage" class="hidden">
+                        <div class="loading-spinner"></div>
+                        <p>Generating Code Changes... Please wait.</p>
+                    </div>
+                    <h2>Proposed Code Change:</h2>
+                    <div id="result"></div>
                 </div>
-                <h2>Proposed Code Change:</h2>
-                <div id="result"></div>
+                <!-- Firebase SDKs -->
+                <script nonce="${nonce}" src="${firebaseAppUri}"></script>
+                <script nonce="${nonce}" src="${firebaseAuthUri}"></script>
                 
                 <script nonce="${nonce}" src="${markedUri}"></script>
                 <!-- Add Prism.js script to enable highlighting -->
@@ -794,7 +767,7 @@ function getNonce() {
     return text;
 }
 
-// NEW: Function to parse LLM response into structured changes and explanation
+
 interface ProposedFileChange {
     filePath: string;
     content: string; // The full proposed content of the file

@@ -2,6 +2,13 @@ console.log('main.js loaded.');
 
 const vscode = acquireVsCodeApi();
 
+const authSection = document.getElementById('auth-section');
+const appSection = document.getElementById('app-section');
+const emailInput = document.getElementById('emailInput');
+const passwordInput = document.getElementById('passwordInput');
+const loginButton = document.getElementById('loginButton');
+const authStatus = document.getElementById('authStatus');
+
 const userStoryTextArea = document.getElementById('userStory');
 const generateButton = document.getElementById('generateButton');
 const resultDiv = document.getElementById('result');
@@ -19,6 +26,71 @@ if (resultDiv) {
 } else {
     document.body.appendChild(applySelectedButton);
 }
+
+// --- Firebase Initialization (Add your Firebase Config here) ---
+// You MUST replace this with your actual Firebase project configuration.
+// Get this from Firebase Console -> Project settings -> Your apps -> Web app -> Config
+const firebaseConfig = {
+  apiKey: "AIzaSyD-ufVjCUr7Ub_7arhrW5tqwfk9N_QPsfw",
+  authDomain: "saralflowapis.firebaseapp.com",
+  projectId: "saralflowapis",
+  storageBucket: "saralflowapis.firebasestorage.app",
+  messagingSenderId: "59243082833",
+  appId: "1:59243082833:web:821bafed4b8588b4c63470",
+  measurementId: "G-WK522LTEFX"
+};
+
+// Initialize Firebase
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+
+let firebaseIdToken = null; // Store the ID token here
+
+loginButton.addEventListener('click', async () => {
+    const email = emailInput.value;
+    const password = passwordInput.value;
+    authStatus.textContent = 'Logging in...';
+    authStatus.style.color = 'gray';
+
+    try {
+        const userCredential = await auth.signInWithEmailAndPassword(email, password);
+        const user = userCredential.user;
+        firebaseIdToken = await user.getIdToken();
+        authStatus.textContent = `Logged in as ${user.email}!`;
+        authStatus.style.color = 'green';
+        console.log('Firebase ID Token obtained:', firebaseIdToken);
+
+        // Hide auth section, show app section
+        authSection.classList.add('hidden');
+        appSection.classList.remove('hidden');
+
+        // Send token to extension for storage/use if needed
+        vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
+
+    } catch (error) {
+        authStatus.textContent = `Login failed: ${error.message}`;
+        authStatus.style.color = 'red';
+        console.error('Firebase Login Error:', error);
+    }
+});
+
+// Initial check for existing login state (optional, but good for persistence)
+auth.onAuthStateChanged(async (user) => {
+    if (user) {
+        firebaseIdToken = await user.getIdToken();
+        authStatus.textContent = `Already logged in as ${user.email}!`;
+        authStatus.style.color = 'green';
+        console.log('Firebase ID Token obtained on startup:', firebaseIdToken);
+        authSection.classList.add('hidden');
+        appSection.classList.remove('hidden');
+        vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
+    } else {
+        authStatus.textContent = 'Please log in.';
+        authStatus.style.color = 'initial';
+        authSection.classList.remove('hidden');
+        appSection.classList.add('hidden');
+    }
+});
 
 
 applySelectedButton.addEventListener('click', () => {
@@ -39,7 +111,14 @@ applySelectedButton.addEventListener('click', () => {
 });
 
 generateButton.addEventListener('click', () => {
+    
     const userStory = userStoryTextArea.value;
+
+    if (!firebaseIdToken) {
+        vscode.postMessage({ command: 'showError', text: 'Please log in to Firebase first.' });
+        return;
+    }
+    
     if (userStory) {
         // Clear previous results and show loading message
         resultDiv.innerHTML = '';

@@ -32,7 +32,22 @@
         "command": "SaralFlow.openGenerator",
         "title": "SaralFlow: Open Code Generator"
       }
-    ]
+    ],
+    "configuration": {
+    "title": "SaralFlow Configuration",
+    "properties": {
+      "saralflow.cloudFunctions.generateCodeUrl": {
+        "type": "string",
+        "default": "https://us-central1-saralflowapis.cloudfunctions.net/generateCode",
+        "description": "The URL for the SaralFlow 'generateCode' Cloud Function."
+      },
+      "saralflow.cloudFunctions.generateEmbeddingUrl": {
+        "type": "string",
+        "default": "https://us-central1-saralflowapis.cloudfunctions.net/generateEmbedding",
+        "description": "The URL for the SaralFlow 'generateEmbedding' Cloud Function."
+      }
+    }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

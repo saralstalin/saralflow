@@ -1,10 +1,10 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
 import {CodeGraph, INode, IEdge, EdgeType, toNodeKind, generateNodeId,  ISemanticGraph, NodeKind  } from './graphTypes';
-import { getEmbedding } from './embeddingService';
-import { getApiKey, semanticGraph } from './extension';
+import { getEmbeddingViaCloudFunction } from './embeddingService'; // Updated import
+import {  semanticGraph, firebaseIdToken } from './extension'; // Import firebaseIdToken
+import pLimit from 'p-limit';
 
-
+const limit = pLimit(10);
 
 /**
  * Extracts a complete semantic graph from the workspace, now returning a CodeGraph instance.
@@ -12,20 +12,16 @@ import { getApiKey, semanticGraph } from './extension';
 export async function extractSemanticGraph(): Promise<CodeGraph> {
     const graph = new CodeGraph(); // Create a new CodeGraph instance
     const processedFiles = new Set<string>();
-    let apiKey: string | undefined;
-    try {
-        apiKey = await getApiKey();
-    } catch (e) {
-        console.error(`[SaralFlow Graph] Failed to retrieve API Key: ${e}`);
-        apiKey = undefined;
-    }
-    const useEmbeddings = !!apiKey;
+    
+    // Embeddings will now be enabled if firebaseIdToken is available
+    const useEmbeddings = !!firebaseIdToken; 
     if (!useEmbeddings) {
-        vscode.window.showWarningMessage('SaralFlow Graph: API Key not set. Node embeddings will not be generated. Semantic similarity search will be limited or unavailable.');
-        console.warn('[SaralFlow Graph] API Key not available. Embeddings will not be generated.');
+        vscode.window.showWarningMessage('SaralFlow Graph: Firebase login not detected. Node embeddings will not be generated. Semantic similarity search will be limited or unavailable.');
+        console.warn('[SaralFlow Graph] Firebase ID Token not available. Embeddings will not be generated.');
     } else {
-        console.log('[SaralFlow Graph] API Key available. Embeddings will be generated.');
+        console.log('[SaralFlow Graph] Firebase ID Token available. Embeddings will be generated via Cloud Function.');
     }
+
     if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
         vscode.window.showInformationMessage('No workspace folder open. Cannot build graph.');
         console.error('[SaralFlow Graph] ERROR: No workspace folder open.');
@@ -182,12 +178,14 @@ export async function extractSemanticGraph(): Promise<CodeGraph> {
                 textToEmbed.substring(0, maxEmbedTextLength) : textToEmbed;
             nodesToEmbed.push({ node, textToEmbed: truncatedText });
         } else if (useEmbeddings && !node.codeSnippet) {
+            // Handle cases where codeSnippet might be missing but embedding is desired
+            // For now, we'll just skip embedding if no codeSnippet is available for a node.
         }
     }
-    if (nodesToEmbed.length > 0) {
+    if (nodesToEmbed.length > 0 && useEmbeddings && firebaseIdToken) { // Ensure firebaseIdToken is present
         console.log(`[SaralFlow Graph] Starting parallel embedding for ${nodesToEmbed.length} nodes...`);
         const embeddingPromises = nodesToEmbed.map(item =>
-            getEmbedding(item.textToEmbed, apiKey!)
+            getEmbeddingViaCloudFunction(item.textToEmbed, firebaseIdToken!) // Use the Cloud Function for embedding
                 .then(embedding => ({ node: item.node, embedding }))
                 .catch(error => {
                     console.error(`[SaralFlow Graph] Error embedding node ${item.node.label}: ${error.message}`);
@@ -203,10 +201,10 @@ export async function extractSemanticGraph(): Promise<CodeGraph> {
         }
         console.log(`[SaralFlow Graph] Finished embedding. Successfully embedded ${embeddedNodesCount} nodes.`);
     } else {
-        console.log('[SaralFlow Graph] No nodes found to embed or embeddings were disabled.');
+        console.log('[SaralFlow Graph] No nodes found to embed or embeddings were disabled (missing Firebase token).');
     }
     console.log(`[SaralFlow Graph] Finished generating node embeddings. Successfully embedded ${embeddedNodesCount} nodes.`);
-    vscode.window.showInformationMessage(`SaralFlow Graph: Generated embeddings for ${embeddedNodesCount} nodes.`);
+    vscode.window.showInformationMessage(`SaralFlow Graph: Graph built successfully! Total nodes: ${graph.nodes.size}, Total edges: ${graph.edges.length}.`);
     console.log('[SaralFlow Graph] Building interdependencies (References)...');
     vscode.window.showInformationMessage('SaralFlow Graph: Building interdependencies (References)...');
     let referenceEdgesCount = 0;
@@ -691,65 +689,64 @@ const findContainingSymbolId = (fileUriStr: string, position: vscode.Position): 
 };
 
 
-    /**
-     * A comprehensive function to rebuild all relationships for a file.
-     * It uses the more reliable `vscode.executeReferenceProvider` to find all relationships.
-     * @param fileUri The URI of the file being updated.
-     * @param newNodesInFile The list of new nodes in the file.
-     */
-    export async function rebuildFileReferences(fileUri: vscode.Uri, newNodesInFile: INode[]) {
-        for (const node of newNodesInFile) {
-            if (node.kind === 'File') {
-                continue;
-            }
-            
-            if (!node.range) {
-                console.warn(`[SaralFlow Graph] Skipping reference rebuild for "${node.label}" as it has no range.`);
-                continue;
-            }
+/**
+ * A comprehensive function to rebuild all relationships for a file.
+ * It uses the more reliable `vscode.executeReferenceProvider` to find all relationships.
+ * @param fileUri The URI of the file being updated.
+ * @param newNodesInFile The list of new nodes in the file.
+ */
+export async function rebuildFileReferences(fileUri: vscode.Uri, newNodesInFile: INode[]) {
+    for (const node of newNodesInFile) {
+        if (node.kind === 'File') {
+            continue;
+        }
+        
+        if (!node.range) {
+            console.warn(`[SaralFlow Graph] Skipping reference rebuild for "${node.label}" as it has no range.`);
+            continue;
+        }
 
-            try {
-                const references = await vscode.commands.executeCommand<vscode.Location[]>(
-                    'vscode.executeReferenceProvider',
-                    fileUri,
-                    node.range.start
-                );
+        try {
+            const references = await vscode.commands.executeCommand<vscode.Location[]>(
+                'vscode.executeReferenceProvider',
+                fileUri,
+                node.range.start
+            );
 
-                if (references && references.length > 0) {
-                    references.forEach(referenceLocation => {
-                        const refFileUriStr = referenceLocation.uri.toString();
-                        
-                        // Add a check to ensure node.range is defined before using it
-                        if (node.range && refFileUriStr === node.uri && referenceLocation.range.isEqual(node.range)) {
-                            return;
-                        }
-                        
-                        const fromNodeId = findContainingSymbolId(refFileUriStr, referenceLocation.range.start);
-                        
-                        if (fromNodeId) {
-                            if (semanticGraph.nodes.has(fromNodeId) && fromNodeId !== node.id) {
-                                const isDuplicateEdge = semanticGraph.edges.some(e => e.from === fromNodeId && e.to === node.id && e.label === EdgeType.REFERENCES);
-                                if (!isDuplicateEdge) {
-                                    semanticGraph.addEdge({ from: fromNodeId, to: node.id, label: EdgeType.REFERENCES });
-                                }
-                            }
-                        } else {
-                            const fileContainingRefId = referenceLocation.uri.toString();
-                            if (semanticGraph.nodes.has(fileContainingRefId) && fileContainingRefId !== node.id) {
-                                const isDuplicateEdge = semanticGraph.edges.some(e => e.from === fileContainingRefId && e.to === node.id && e.label === EdgeType.REFERENCES);
-                                if (!isDuplicateEdge) {
-                                    semanticGraph.addEdge({ from: fileContainingRefId, to: node.id, label: EdgeType.REFERENCES });
-                                }
+            if (references && references.length > 0) {
+                references.forEach(referenceLocation => {
+                    const refFileUriStr = referenceLocation.uri.toString();
+                    
+                    // Add a check to ensure node.range is defined before using it
+                    if (node.range && refFileUriStr === node.uri && referenceLocation.range.isEqual(node.range)) {
+                        return;
+                    }
+                    
+                    const fromNodeId = findContainingSymbolId(refFileUriStr, referenceLocation.range.start);
+                    
+                    if (fromNodeId) {
+                        if (semanticGraph.nodes.has(fromNodeId) && fromNodeId !== node.id) {
+                            const isDuplicateEdge = semanticGraph.edges.some(e => e.from === fromNodeId && e.to === node.id && e.label === EdgeType.REFERENCES);
+                            if (!isDuplicateEdge) {
+                                semanticGraph.addEdge({ from: fromNodeId, to: node.id, label: EdgeType.REFERENCES });
                             }
                         }
-                    });
-                }
-            } catch (error) {
-                console.warn(`[SaralFlow Graph] Could not fetch references for "${node.label}" (URI: ${node.uri}). Error:`, error);
+                    } else {
+                        const fileContainingRefId = referenceLocation.uri.toString();
+                        if (semanticGraph.nodes.has(fileContainingRefId) && fileContainingRefId !== node.id) {
+                            const isDuplicateEdge = semanticGraph.edges.some(e => e.from === fileContainingRefId && e.to === node.id && e.label === EdgeType.REFERENCES);
+                            if (!isDuplicateEdge) {
+                                semanticGraph.addEdge({ from: fileContainingRefId, to: node.id, label: EdgeType.REFERENCES });
+                            }
+                        }
+                    }
+                });
             }
+        } catch (error) {
+            console.warn(`[SaralFlow Graph] Could not fetch references for "${node.label}" (URI: ${node.uri}). Error:`, error);
         }
     }
-
+}
 
 /**
  * Rebuilds all relationships for affected nodes after a file change.
@@ -760,15 +757,12 @@ const findContainingSymbolId = (fileUriStr: string, position: vscode.Position): 
 export async function rebuildAffectedReferences(removedEdges: IEdge[], newNodesInFile: INode[]) {
     console.log(`[SaralFlow Graph] Rebuilding references for ${newNodesInFile.length} new nodes and ${removedEdges.length} removed edges.`);
     
-    // Check for API key and enable/disable embeddings
-    const apiKey = await getApiKey();
-    const useEmbeddings = !!apiKey;
     const nodesToEmbed: { node: INode; textToEmbed: string }[] = [];
 
     // Part 1: Rebuild references for the newly added nodes and prepare them for embedding
     for (const node of newNodesInFile) {
         // Collect nodes for embedding
-        if (useEmbeddings && node.codeSnippet) {
+        if ( node.codeSnippet) {
             const textToEmbed = `${node.kind}: ${node.label}\n${node.detail || ''}\n${node.codeSnippet}`;
             const maxEmbedTextLength = 8000;
             const truncatedText = textToEmbed.length > maxEmbedTextLength ?
@@ -835,10 +829,10 @@ export async function rebuildAffectedReferences(removedEdges: IEdge[], newNodesI
     }
 
     // Part 3: Re-embed the newly added nodes
-    if (nodesToEmbed.length > 0 && useEmbeddings && apiKey) {
+    if (nodesToEmbed.length > 0  && firebaseIdToken) {
         console.log(`[SaralFlow Graph] Starting parallel embedding for ${nodesToEmbed.length} new nodes...`);
         const embeddingPromises = nodesToEmbed.map(item =>
-            getEmbedding(item.textToEmbed, apiKey)
+            getEmbeddingViaCloudFunction(item.textToEmbed, firebaseIdToken!)
                 .then(embedding => ({ node: item.node, embedding }))
                 .catch(error => {
                     console.error(`[SaralFlow Graph] Error embedding new node ${item.node.label}: ${error.message}`);
@@ -859,4 +853,59 @@ export async function rebuildAffectedReferences(removedEdges: IEdge[], newNodesI
     }
     
     console.log(`[SaralFlow Graph] Finished rebuilding affected references.`);
+}
+
+/**
+ * Re-embeds nodes in the semantic graph that do not yet have an embedding.
+ * This function should be called after Firebase authentication is complete.
+ */
+export async function reEmbedGraphNodes() {
+    if (!firebaseIdToken) {
+        console.warn('[SaralFlow Graph] Cannot re-embed nodes: Firebase ID Token is not available.');
+        vscode.window.showWarningMessage('SaralFlow Graph: Cannot re-embed nodes. Please log in to Firebase.');
+        return;
+    }
+
+    console.log('[SaralFlow Graph] Starting re-embedding of graph nodes...');
+    vscode.window.showInformationMessage('SaralFlow Graph: Re-embedding graph nodes (this may take a while)...');
+
+    let reEmbeddedNodesCount = 0;
+    const nodesToReEmbed: { node: INode; textToEmbed: string }[] = [];
+
+    for (const [id, node] of semanticGraph.nodes.entries()) {
+        // Only re-embed if the node doesn't have an embedding yet and has a code snippet
+        if (!node.embedding && node.codeSnippet) {
+            const textToEmbed = `${node.kind}: ${node.label}\n${node.detail || ''}\n${node.codeSnippet}`;
+            const maxEmbedTextLength = 8000;
+            const truncatedText = textToEmbed.length > maxEmbedTextLength ?
+                textToEmbed.substring(0, maxEmbedTextLength) : textToEmbed;
+            nodesToReEmbed.push({ node, textToEmbed: truncatedText });
+        }
+    }
+
+    if (nodesToReEmbed.length > 0) {
+        console.log(`[SaralFlow Graph] Found ${nodesToReEmbed.length} nodes to re-embed.`);
+        const embeddingPromises = nodesToReEmbed.map(item =>
+            limit(() => // Use p-limit for concurrency control
+                getEmbeddingViaCloudFunction(item.textToEmbed, firebaseIdToken!)
+                    .then(embedding => ({ node: item.node, embedding }))
+                    .catch(error => {
+                        console.error(`[SaralFlow Graph] Error re-embedding node ${item.node.label}: ${error.message}`);
+                        return { node: item.node, embedding: null };
+                    })
+            )
+        );
+        const embeddingResults = await Promise.all(embeddingPromises);
+        for (const result of embeddingResults) {
+            if (result.embedding) {
+                result.node.embedding = result.embedding;
+                reEmbeddedNodesCount++;
+            }
+        }
+        console.log(`[SaralFlow Graph] Finished re-embedding. Successfully re-embedded ${reEmbeddedNodesCount} nodes.`);
+        vscode.window.showInformationMessage(`SaralFlow Graph: Re-embedded ${reEmbeddedNodesCount} nodes.`);
+    } else {
+        console.log('[SaralFlow Graph] No nodes found requiring re-embedding.');
+        vscode.window.showInformationMessage('SaralFlow Graph: All nodes already have embeddings.');
+    }
 }

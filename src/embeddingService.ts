@@ -1,3 +1,16 @@
+import * as vscode from 'vscode';
+const config = vscode.workspace.getConfiguration('saralflow');
+
+const generateEmbeddingFunctionUrl = config.get<string>('cloudFunctions.generateEmbeddingUrl') 
+                                     || 'https://us-central1-saralflowapis.cloudfunctions.net/generateEmbedding';
+
+// Define the expected structure of the Cloud Function's response for generateEmbedding
+export interface GenerateEmbeddingResponse {
+    success: boolean;
+    embedding?: number[]; // The embedding vector
+    error?: string; // Error message if success is false
+}
+
 /**
  * Calculates the cosine similarity between two vectors.
  * @param vec1 The first vector.
@@ -30,38 +43,41 @@ export function cosineSimilarity(vec1: number[], vec2: number[]): number {
     return dotProduct / (magnitude1 * magnitude2);
 }
 
-/**
- * Generates an embedding for the given text using OpenAI's embedding API.
+
+/***
+ * Generates an embedding for the given text by calling the Cloud Function.
  * @param text The text to embed.
- * @param apiKey Your OpenAI API key.
+ * @param firebaseIdToken The Firebase ID token for authentication.
  * @returns A promise that resolves to the embedding vector (number[]) or null if an error occurs.
  */
-export async function getEmbedding(text: string, apiKey: string): Promise<number[] | null> {
+export async function getEmbeddingViaCloudFunction(text: string, firebaseIdToken: string): Promise<number[] | null> {
+   
     try {
-        const response = await fetch('https://api.openai.com/v1/embeddings', {
+        const response = await fetch(generateEmbeddingFunctionUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
+                'Authorization': `Bearer ${firebaseIdToken}` // Include the Firebase ID token
             },
-            body: JSON.stringify({
-                model: 'text-embedding-ada-002', // Recommended embedding model
-                input: text
-            })
+            body: JSON.stringify({ text: text }) // Send the text to be embedded
         });
 
         if (!response.ok) {
-            const errorData: any = await response.json();
-            console.error('OpenAI Embedding API error:', errorData);
-            throw new Error(`Embedding API error: ${response.status} - ${errorData.error ? errorData.error.message : response.statusText}`);
+            const errorText = await response.text();
+            console.error(`Cloud Function (generateEmbedding) error: ${response.status} - ${errorText}`);
+            throw new Error(`Embedding Cloud Function error: ${response.status} - ${errorText}`);
         }
 
-        const data: any = await response.json();
-        return data.data[0].embedding;
-    } catch (error: any) {
-        console.error('Error getting embedding:', error);
-        // Do not show error message here, as it might spam if many files fail.
-        // The calling function (loadSchemaContext) will handle overall errors.
+        const result = await response.json() as GenerateEmbeddingResponse;
+
+        if (result.success && result.embedding) {
+            return result.embedding;
+        } else {
+            console.error('Invalid response from generateEmbedding Cloud Function:', result.error);
+            return null;
+        }
+    } catch (error) {
+        console.error('Error calling generateEmbedding Cloud Function:', error);
         return null;
     }
 }
