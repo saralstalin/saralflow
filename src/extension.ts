@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-
-import { CodeGraph,  INode, IEdge } from './graphTypes'; 
+import * as fs from 'fs';
+import { CodeGraph,  INode } from './graphTypes'; 
 import { getEmbeddingViaCloudFunction, cosineSimilarity } from'./embeddingService';
 import {extractSemanticGraph,  processFileAndAddToGraph, removeFileNodesFromGraph, rebuildAffectedReferences, reEmbedGraphNodes} from './graphBuilder';
 const config = vscode.workspace.getConfiguration('saralflow');
@@ -10,21 +10,13 @@ const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeU
                                      || 'https://us-central1-saralflowapis.cloudfunctions.net/generateCode';
 
 const DiffMatchPatch: any = require('diff-match-patch'); 
-// Keep track of the last parsed changes to apply them
-let lastProposedChanges: ProposedFileChange[] = [];
-let currentGraph: CodeGraph = new CodeGraph(); // Our in-memory graph instance
 // Declare panel globally so it can be reused or disposed
 let graphPanel: vscode.WebviewPanel | undefined = undefined;
-
 let codeViewPanel: vscode.WebviewPanel | undefined = undefined;
-
 let extensionContext: vscode.ExtensionContext;
-
-
 // Global variable to store the built graph
 export let semanticGraph: CodeGraph = new CodeGraph();
 let isGraphBuilding = false;
-
 // Global variable to store the Firebase ID Token received from the webview
 export let firebaseIdToken: string | null = null;
 
@@ -561,7 +553,6 @@ async function proposeCodeFromStory(userStory: string) {
             // Extract the text from the response and then parse it
             const llmResponseText = result.text;
             const parsedResult = await parseLLMResponse(llmResponseText); // Pass the text content
-            lastProposedChanges = parsedResult.fileChanges;
 
             codeViewPanel?.webview.postMessage({
                 command: 'displayParsedResult',
@@ -612,7 +603,7 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
     }
     codeViewPanel = vscode.window.createWebviewPanel(
         'saralFlowGenerator', // type
-        'SaralFlow Code Generator', // title
+        'SaralFlow : Story to Code', // title
         vscode.ViewColumn.Beside, // column
         {
             enableScripts: true,
@@ -672,6 +663,7 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                         vscode.window.showWarningMessage('No selected changes to apply.');
                     }
                     break;
+                
             }
         },
         undefined, // This 'thisArg' is optional
@@ -689,7 +681,7 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     const scriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'main.js');
     const markedScriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'marked.min.js'); 
     const stylePathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'styles.css');
-
+    const htmlPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'index.html'); // Path to the new HTML file
 
     // And the uri to the script and style for the webview
     const scriptUri = webview.asWebviewUri(scriptPathOnDisk);
@@ -705,56 +697,27 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     // Firebase SDK URIs
     const firebaseAppUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'firebase-app-compat.js'));
     const firebaseAuthUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'firebase-auth-compat.js'));
-   
+    
+    // Read the HTML content
+    const htmlContent = fs.readFileSync(htmlPathOnDisk.fsPath, 'utf8');
+
     // Use a nonce to only allow a specific script to be run.
     const nonce = getNonce();
 
-    return `<!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' https://www.gstatic.com; connect-src https://*.firebaseio.com https://*.firebaseauth.com https://securetoken.googleapis.com https://identitytoolkit.googleapis.com;">
-                <link href="${styleUri}" rel="stylesheet">
-                <!-- Add Prism.js CSS for a dark theme -->
-                <link href="${prismCssUri}" rel="stylesheet">
-                <title>SaralFlow Code Generator</title>
-            </head>
-            <body>
-                <h1>SaralFlow: Story to Code</h1>
-                <div id="auth-section">
-                    <h2>Firebase Login</h2>
-                    <input type="email" id="emailInput" placeholder="Email" value="testuser@test.com" />
-                    <input type="password" id="passwordInput" placeholder="Password" value="test&test" />
-                    <button id="loginButton">Login</button>
-                    <p id="authStatus"></p>
-                </div>
-                <hr>
-                <p>Describe the feature or change you want to implement:</p>
-                <textarea id="userStory" rows="10" cols="60" placeholder="e.g., 'As a user, I want to add a new API endpoint that lists all products with a 'special' tag.'"></textarea>
-                <br>
-                <button id="generateButton">Generate Code</button>
-                <hr>
-                <div id="app-section" class="hidden">
-                    <div id="loadingMessage" class="hidden">
-                        <div class="loading-spinner"></div>
-                        <p>Generating Code Changes... Please wait.</p>
-                    </div>
-                    <h2>Proposed Code Change:</h2>
-                    <div id="result"></div>
-                </div>
-                <!-- Firebase SDKs -->
-                <script nonce="${nonce}" src="${firebaseAppUri}"></script>
-                <script nonce="${nonce}" src="${firebaseAuthUri}"></script>
-                
-                <script nonce="${nonce}" src="${markedUri}"></script>
-                <!-- Add Prism.js script to enable highlighting -->
-                <script nonce="${nonce}" src="${prismJsUri}"></script>
-                <script nonce="${nonce}" src="${prismSQLUri}"></script>
-                <script nonce="${nonce}" src="${prismCsharpUri}"></script>
-                <script nonce="${nonce}" src="${scriptUri}"></script>
-            </body>
-            </html>`;
+    const finalHtml = htmlContent
+        .replace(/\{\{styleUri\}\}/g, styleUri.toString())
+        .replace(/\{\{prismCssUri\}\}/g, prismCssUri.toString())
+        .replace(/\{\{firebaseAppUri\}\}/g, firebaseAppUri.toString())
+        .replace(/\{\{firebaseAuthUri\}\}/g, firebaseAuthUri.toString())
+        .replace(/\{\{markedUri\}\}/g, markedUri.toString())
+        .replace(/\{\{prismJsUri\}\}/g, prismJsUri.toString())
+        .replace(/\{\{prismSQLUri\}\}/g, prismSQLUri.toString())
+        .replace(/\{\{prismCsharpUri\}\}/g, prismCsharpUri.toString())
+        .replace(/\{\{scriptUri\}\}/g, scriptUri.toString())
+        .replace(/\{\{nonce\}\}/g, nonce)
+        .replace(/\{\{webview\.cspSource\}\}/g, webview.cspSource);
+
+    return finalHtml;
 }
 
 // Utility to generate a nonce for Content Security Policy
@@ -789,7 +752,7 @@ interface ParsedLLMResponse {
  */
 export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMResponse> {
     const fileChanges: ProposedFileChange[] = [];
-    let explanation = '';
+    let explanationLines: string[] = [];
     const lines = llmResponse.split('\n');
     let currentFilePath: string | null = null;
     let currentContent: string[] = [];
@@ -799,6 +762,7 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
     const startFileMarker = '--- START FILE: ';
     const endFileMarker = '--- END FILE: ';
     const explanationStart = 'Explanation:';
+    const explanationEnd = '--- END EXPLANATION ---'; // New marker for the end of the explanation
     const codeBlockRegex = /^\s*```.*/;
 
     for (const line of lines) {
@@ -806,6 +770,31 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
 
         // Skip lines that are just code block markers
         if (codeBlockRegex.test(trimmedLine)) {
+            continue;
+        }
+
+        // Check for the explanation marker first, as it can appear anywhere
+        const explanationIndex = line.indexOf(explanationStart);
+        if (explanationIndex !== -1 && currentFilePath === null) {
+            // Found the start of the explanation block
+            parsingExplanation = true;
+            // Capture the text after the explanation marker on the same line
+            const firstLineOfExplanation = line.substring(explanationIndex + explanationStart.length).trim();
+            if (firstLineOfExplanation.length > 0) {
+                explanationLines.push(firstLineOfExplanation);
+            }
+            continue;
+        }
+
+        if (parsingExplanation) {
+            if (trimmedLine === explanationEnd) {
+                parsingExplanation = false;
+                continue;
+            }
+            // Append lines to the explanation, but only if they are not blank
+            if (line.trim().length > 0) {
+                explanationLines.push(line);
+            }
             continue;
         }
 
@@ -839,16 +828,6 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
             }
             currentFilePath = null; // Clear the current file path
             currentContent = [];
-        } else if (trimmedLine.startsWith(explanationStart)) {
-            // Found the start of the explanation block
-            parsingExplanation = true;
-            explanation = trimmedLine.substring(explanationStart.length).trim() + '\n';
-            // Stop parsing file content if explanation begins
-            currentFilePath = null;
-            currentContent = [];
-        } else if (parsingExplanation) {
-            // Append lines to the explanation
-            explanation += line + '\n';
         } else if (currentFilePath !== null) {
             // Collect file content
             currentContent.push(line);
@@ -884,8 +863,10 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
         }
     }
     
-    return { fileChanges, explanation: explanation.trim() };
+    return { fileChanges, explanation: explanationLines.join('\n').trim() };
 }
+
+
 
 // This is the unified function to apply code changes using diff-match-patch
 async function applyCodeChanges(changesToApply: ProposedFileChange[]) {

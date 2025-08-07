@@ -15,7 +15,6 @@
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-      
       {
         "command": "SaralFlow.showGraph",
         "title": "Show Code Semantic Graph"
@@ -34,19 +33,19 @@
       }
     ],
     "configuration": {
-    "title": "SaralFlow Configuration",
-    "properties": {
-      "saralflow.cloudFunctions.generateCodeUrl": {
-        "type": "string",
-        "default": "https://us-central1-saralflowapis.cloudfunctions.net/generateCode",
-        "description": "The URL for the SaralFlow 'generateCode' Cloud Function."
-      },
-      "saralflow.cloudFunctions.generateEmbeddingUrl": {
-        "type": "string",
-        "default": "https://us-central1-saralflowapis.cloudfunctions.net/generateEmbedding",
-        "description": "The URL for the SaralFlow 'generateEmbedding' Cloud Function."
+      "title": "SaralFlow Configuration",
+      "properties": {
+        "saralflow.cloudFunctions.generateCodeUrl": {
+          "type": "string",
+          "default": "https://us-central1-saralflowapis.cloudfunctions.net/generateCode",
+          "description": "The URL for the SaralFlow 'generateCode' Cloud Function."
+        },
+        "saralflow.cloudFunctions.generateEmbeddingUrl": {
+          "type": "string",
+          "default": "https://us-central1-saralflowapis.cloudfunctions.net/generateEmbedding",
+          "description": "The URL for the SaralFlow 'generateEmbedding' Cloud Function."
+        }
       }
-    }
     }
   },
   "scripts": {
@@ -83,6 +82,7 @@
   },
   "dependencies": {
     "diff-match-patch": "^1.0.5",
+    "firebase": "^12.0.0",
     "marked": "^16.1.1",
     "node-fetch": "^2.7.0",
     "openai": "^5.10.2"

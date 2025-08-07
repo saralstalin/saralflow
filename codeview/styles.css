@@ -43,8 +43,7 @@ button:hover {
     word-wrap: break-word; /* Break long words */
 }
 
-/* Styling for the container of each file change */
-.file-change-container {
+file-change-container {
     margin-bottom: 20px;
     padding: 10px;
     border: 1px solid var(--vscode-editorGroup-border);
@@ -58,24 +57,42 @@ button:hover {
     min-height: 100px;
     padding: 15px;
     margin-top: 5px;
-    background-color: var(--vscode-input-background);
+    /* Use VS Code's input background for a consistent look */
+    background-color: var(--vscode-input-background); 
     color: var(--vscode-input-foreground);
-    border: 1px solid #333; /* Darker border for the contrast */
-    border-radius: 8px; /* Slightly more rounded corners */
+    /* Use a more subtle, theme-aware border color */
+    border: 1px solid var(--vscode-editorGroup-border); 
+    border-radius: 8px; 
     font-family: 'Courier New', Courier, monospace;
     font-size: 14px;
     line-height: 1.5;
     resize: vertical;
     box-sizing: border-box;
-    overflow-x: auto; /* Allow horizontal scrolling */
+    overflow-x: auto; 
     white-space: pre-wrap;
     word-wrap: break-word;
-    box-shadow: inset 0 0 5px rgba(0, 0, 0, 0.5); /* A subtle inner shadow to add depth */
+    /* Remove the harsh inner shadow */
+    box-shadow: none !important;
 }
 
 .code-editable-div:focus {
     outline: 1px solid var(--vscode-focusBorder);
 }
+.code-editable-div pre {
+    /* Use the input background for a subtle shading that works on both themes */
+    background-color: var(--vscode-input-background) !important;
+    color: var(--vscode-editor-foreground) !important;
+    padding: 15px; /* Moved padding here to give space inside the pre tag */
+    margin: 0;
+    box-shadow: none !important; /* Explicitly remove any box-shadow */
+}
+
+.code-editable-div code {
+    background-color: transparent !important;
+    color: inherit !important;
+    padding: 0;
+}
+
 
 /* Style for the loading spinner */
 .loading-spinner {
@@ -104,4 +121,109 @@ button:hover {
     align-items: center;
     justify-content: center;
     margin-top: 20px;
+}
+
+/* New input group styling for labels and inputs */
+.input-group {
+    text-align: left;
+    margin-bottom: 10px;
+}
+
+.input-group label {
+    display: block;
+    margin-bottom: 5px;
+    font-size: 14px;
+    color: var(--vscode-editor-foreground);
+}
+
+input[type="email"],
+input[type="password"] {
+    width: 85%;
+    padding: 10px;
+    border: 1px solid var(--vscode-input-border, #ccc); 
+    border-radius: 4px;
+    background-color: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+/* Login/Register buttons */
+.auth-buttons {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 15px;
+}
+
+.auth-buttons button {
+    flex-grow: 1;
+    padding: 10px;
+    border: none;
+    border-radius: 4px;
+    background-color: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.auth-buttons button:hover {
+    background-color: var(--vscode-button-hoverBackground);
+}
+
+#authStatus {
+    color: var(--vscode-foreground);
+    margin-top: 15px;
+    min-height: 20px; /* Gives the element space even when empty */
+}
+
+/* Re-apply Prism.js styles using theme-aware colors for better contrast */
+.code-editable-div .token.comment,
+.code-editable-div .token.prolog,
+.code-editable-div .token.doctype,
+.code-editable-div .token.cdata {
+    color: #6a9955; /* A distinct green for comments */
+}
+
+.code-editable-div .token.punctuation {
+    color: var(--vscode-editor-foreground);
+}
+
+.code-editable-div .token.property,
+.code-editable-div .token.tag,
+.code-editable-div .token.boolean,
+.code-editable-div .token.number,
+.code-editable-div .token.constant,
+.code-editable-div .token.symbol {
+    color: #b5cea8; /* Light green for numbers and symbols */
+}
+
+.code-editable-div .token.selector,
+.code-editable-div .token.attr-name,
+.code-editable-div .token.string,
+.code-editable-div .token.entity,
+.code-editable-div .token.url,
+.code-editable-div .language-css .token.string,
+.code-editable-div .style .token.string {
+    color: #ce9178; /* Orange for strings */
+}
+
+.code-editable-div .token.atrule,
+.code-editable-div .token.keyword {
+    color: #c586c0; /* Purple for keywords and at-rules */
+}
+
+.code-editable-div .token.function,
+.code-editable-div .token.class-name {
+    color: #dcdcaa; /* Yellow for functions and classes */
+}
+
+.code-editable-div .token.regex,
+.code-editable-div .token.important,
+.code-editable-div .token.variable {
+    color: #9cdcfe; /* Light blue for variables */
+}
+
+.code-editable-div .token.operator,
+.code-editable-div .token.builtin {
+    color: var(--vscode-editor-foreground);
 }

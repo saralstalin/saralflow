@@ -7,6 +7,7 @@ const appSection = document.getElementById('app-section');
 const emailInput = document.getElementById('emailInput');
 const passwordInput = document.getElementById('passwordInput');
 const loginButton = document.getElementById('loginButton');
+const registerButton = document.getElementById('registerButton'); // New registration button
 const authStatus = document.getElementById('authStatus');
 
 const userStoryTextArea = document.getElementById('userStory');
@@ -14,13 +15,11 @@ const generateButton = document.getElementById('generateButton');
 const resultDiv = document.getElementById('result');
 const loadingMessage = document.getElementById('loadingMessage');
 
-
 const applySelectedButton = document.createElement('button');
 applySelectedButton.id = 'applySelectedButton';
 applySelectedButton.textContent = 'Apply Changes';
-applySelectedButton.style.display = 'none'; // Initially hidden
+applySelectedButton.style.display = 'none';
 
-// Add both buttons to the DOM
 if (resultDiv) {
     resultDiv.after(applySelectedButton);
 } else {
@@ -28,8 +27,6 @@ if (resultDiv) {
 }
 
 // --- Firebase Initialization (Add your Firebase Config here) ---
-// You MUST replace this with your actual Firebase project configuration.
-// Get this from Firebase Console -> Project settings -> Your apps -> Web app -> Config
 const firebaseConfig = {
   apiKey: "AIzaSyD-ufVjCUr7Ub_7arhrW5tqwfk9N_QPsfw",
   authDomain: "saralflowapis.firebaseapp.com",
@@ -40,53 +37,92 @@ const firebaseConfig = {
   measurementId: "G-WK522LTEFX"
 };
 
-// Initialize Firebase
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
+const provider = new firebase.auth.GoogleAuthProvider(); // Google Auth Provider
 
-let firebaseIdToken = null; // Store the ID token here
+let firebaseIdToken = null;
 
+
+// Existing login listener
 loginButton.addEventListener('click', async () => {
     const email = emailInput.value;
     const password = passwordInput.value;
+
+    if (!email || !password) {
+        authStatus.textContent = 'Please enter both email and password to login.';
+        return;
+    }
+
+    if (!isValidEmail(email)) {
+        authStatus.textContent = 'Please enter a valid email address.';
+        return;
+    }
+
     authStatus.textContent = 'Logging in...';
-    authStatus.style.color = 'gray';
 
     try {
         const userCredential = await auth.signInWithEmailAndPassword(email, password);
-        const user = userCredential.user;
-        firebaseIdToken = await user.getIdToken();
-        authStatus.textContent = `Logged in as ${user.email}!`;
-        authStatus.style.color = 'green';
-        console.log('Firebase ID Token obtained:', firebaseIdToken);
-
-        // Hide auth section, show app section
-        authSection.classList.add('hidden');
-        appSection.classList.remove('hidden');
-
-        // Send token to extension for storage/use if needed
-        vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
-
+        handleSuccessfulAuth(userCredential.user);
     } catch (error) {
-        authStatus.textContent = `Login failed: ${error.message}`;
-        authStatus.style.color = 'red';
+        authStatus.textContent = `Login failed, Please re-check email/password. If you are new user, click on register instead.`;
         console.error('Firebase Login Error:', error);
     }
 });
 
-// Initial check for existing login state (optional, but good for persistence)
+
+
+// NEW: Registration listener
+registerButton.addEventListener('click', async () => {
+    const email = emailInput.value;
+    const password = passwordInput.value;
+
+    if (!email || !password) {
+        authStatus.textContent = 'Please enter both email and password to register.';
+        return;
+    }
+
+    if (!isValidEmail(email)) {
+        authStatus.textContent = 'Please enter a valid email address.';
+        return;
+    }
+    
+    authStatus.textContent = 'Registering user...';
+
+    try {
+        const userCredential = await auth.createUserWithEmailAndPassword(email, password);
+        authStatus.textContent = `Registration successful! Logged in as ${userCredential.user.email}.`;
+        handleSuccessfulAuth(userCredential.user);
+    } catch (error) {
+        authStatus.textContent = `Registration failed: ${error.message}`;
+        console.error('Firebase Registration Error:', error);
+    }
+});
+
+
+
+
+// New helper function to handle successful authentication
+async function handleSuccessfulAuth(user) {
+    firebaseIdToken = await user.getIdToken();
+    console.log('Firebase ID Token obtained:', firebaseIdToken);
+    
+    authSection.classList.add('hidden');
+    appSection.classList.remove('hidden');
+    
+    vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
+}
+
+// Initial check for existing login state
 auth.onAuthStateChanged(async (user) => {
     if (user) {
         firebaseIdToken = await user.getIdToken();
-        authStatus.textContent = `Already logged in as ${user.email}!`;
-        authStatus.style.color = 'green';
-        console.log('Firebase ID Token obtained on startup:', firebaseIdToken);
+        authStatus.textContent = `Already logged in as ${user.email || user.displayName}!`;
         authSection.classList.add('hidden');
         appSection.classList.remove('hidden');
         vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
     } else {
-        authStatus.textContent = 'Please log in.';
-        authStatus.style.color = 'initial';
+        authStatus.textContent = 'Please log in or register.';
         authSection.classList.remove('hidden');
         appSection.classList.add('hidden');
     }
@@ -153,7 +189,7 @@ function getLanguageFromPath(filePath) {
     }
 }
 
-window.addEventListener('message', event => {
+window.addEventListener('message', async event => {
     const message = event.data;
     switch (message.command) {
         case 'displayParsedResult':
@@ -175,6 +211,17 @@ window.addEventListener('message', event => {
         case 'clearResults':
             resultDiv.innerHTML = '';
             applySelectedButton.style.display = 'none';
+            break;
+        case 'firebaseCustomToken':
+            try {
+                // Use the custom token to sign in to Firebase
+                const userCredential = await auth.signInWithCustomToken(message.token);
+                handleSuccessfulAuth(userCredential.user);
+            } catch (error) {
+                authStatus.textContent = `Google Sign-in failed: ${error.message}`;
+                authStatus.style.color = 'red';
+                console.error('Firebase Custom Token Sign-in Error:', error);
+            }
             break;
         default:
             console.warn('Unknown command received:', message.command, message);
@@ -266,4 +313,11 @@ window.onload = () => {
     if (typeof Prism === 'undefined') {
         console.error('Prism.js is not loaded.');
     }
+};
+
+// Function to validate email format
+function isValidEmail(email) {
+    // A basic regex for email validation
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email);
 }

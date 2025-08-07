@@ -3,6 +3,7 @@
 	
 		"target": "ES2022",
 		"lib": [
+			"dom",
 			"ES2022"
 		],
 		"sourceMap": true,

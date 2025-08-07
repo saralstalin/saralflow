@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{webview.cspSource}} 'unsafe-inline'; script-src 'nonce-{{nonce}}' https://www.gstatic.com; connect-src https://*.firebaseio.com https://*.firebaseauth.com https://securetoken.googleapis.com https://identitytoolkit.googleapis.com;">
+    <link href="{{styleUri}}" rel="stylesheet">
+    <link href="{{prismCssUri}}" rel="stylesheet">
+    <title>SaralFlow : Story to Code</title>
+</head>
+<body>
+    <div id="auth-section">
+        <h2>Login or Register to use SaralFlow</h2>
+        <div class="input-group">
+            <label for="emailInput">Email</label>
+            <input type="email" id="emailInput" placeholder="you@example.com" />
+        </div>
+        <div class="input-group">
+            <label for="passwordInput">Password</label>
+            <input type="password" id="passwordInput" placeholder="Password" />
+        </div>
+        <div class="auth-buttons">
+            <button id="loginButton">Login</button>
+            <button id="registerButton">Register</button>
+        </div>
+        <p id="authStatus"></p>
+    </div>
+    <div id="app-section" class="hidden">
+        <p>Describe the feature or change you want to implement:</p>
+        <textarea id="userStory" rows="10" cols="60" placeholder="e.g., 'As a user, I want to add a new API endpoint that lists all products with a 'special' tag.'"></textarea>
+        <br>
+        <button id="generateButton">Generate Code</button>
+        <hr>
+        <div id="loadingMessage" class="hidden">
+            <div class="loading-spinner"></div>
+            <p>Generating Code Changes... Please wait.</p>
+        </div>
+        <h2>Proposed Code Change:</h2>
+        <div id="result"></div>
+    </div>
+    <script nonce="{{nonce}}" src="{{firebaseAppUri}}"></script>
+    <script nonce="{{nonce}}" src="{{firebaseAuthUri}}"></script>
+    <script nonce="{{nonce}}" src="{{markedUri}}"></script>
+    <script nonce="{{nonce}}" src="{{prismJsUri}}"></script>
+    <script nonce="{{nonce}}" src="{{prismSQLUri}}"></script>
+    <script nonce="{{nonce}}" src="{{prismCsharpUri}}"></script>
+    <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
+</body>
+</html>
