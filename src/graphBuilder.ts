@@ -48,7 +48,6 @@ export async function extractSemanticGraph(): Promise<CodeGraph> {
         return null;
     };
     console.log('[SaralFlow Graph] Ensuring C# extension is active...');
-    vscode.window.showInformationMessage('SaralFlow Graph: Activating C# language services...');
     const csharpExtensionId = 'ms-dotnettools.csharp';
     const csharpExtension = vscode.extensions.getExtension(csharpExtensionId);
     if (!csharpExtension) {
@@ -81,7 +80,6 @@ export async function extractSemanticGraph(): Promise<CodeGraph> {
         return graph;
     }
     console.log(`[SaralFlow Graph] Found ${files.length} code files matching pattern.`);
-    vscode.window.showInformationMessage(`SaralFlow Graph: Found ${files.length} code files. Processing...`);
     for (const fileUri of files) {
         const filePath = fileUri.fsPath;
         const relativePath = vscode.workspace.asRelativePath(fileUri, true);
@@ -167,7 +165,6 @@ export async function extractSemanticGraph(): Promise<CodeGraph> {
     console.log('[SaralFlow Graph] Finished sorting symbols.');
     console.log(`[SaralFlow Graph] DEBUG: After initial file and symbol processing: nodes.length = ${graph.nodes.size}, edges.length = ${graph.edges.length}`);
     console.log(`[SaralFlow Graph] Generating embeddings for ${graph.nodes.size} nodes...`);
-    vscode.window.showInformationMessage(`SaralFlow Graph: Generating embeddings for ${graph.nodes.size} nodes (this may take a while)...`);
     let embeddedNodesCount = 0;
     const nodesToEmbed: { node: INode; textToEmbed: string }[] = [];
     for (const [id, node] of graph.nodes.entries()) {
@@ -204,9 +201,8 @@ export async function extractSemanticGraph(): Promise<CodeGraph> {
         console.log('[SaralFlow Graph] No nodes found to embed or embeddings were disabled (missing Firebase token).');
     }
     console.log(`[SaralFlow Graph] Finished generating node embeddings. Successfully embedded ${embeddedNodesCount} nodes.`);
-    vscode.window.showInformationMessage(`SaralFlow Graph: Graph built successfully! Total nodes: ${graph.nodes.size}, Total edges: ${graph.edges.length}.`);
+    
     console.log('[SaralFlow Graph] Building interdependencies (References)...');
-    vscode.window.showInformationMessage('SaralFlow Graph: Building interdependencies (References)...');
     let referenceEdgesCount = 0;
     for (const [symbolNodeId, symbolNode] of graph.nodes.entries()) {
         if (symbolNode.kind === 'File' || !symbolNode.uri || !symbolNode.range) {
@@ -292,7 +288,6 @@ export async function extractSemanticGraph(): Promise<CodeGraph> {
     }
     console.log(`[SaralFlow Graph] Finished building references. Added ${referenceEdgesCount} reference edges. Current total edges: ${graph.edges.length}`);
     console.log('[SaralFlow Graph] Building interdependencies (Inheritance)...');
-    vscode.window.showInformationMessage('SaralFlow Graph: Building inheritance relationships...');
     let inheritanceEdgesCount = 0;
     for (const [symbolNodeId, symbolNode] of graph.nodes.entries()) {
         if ((symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Class] || symbolNode.kind === vscode.SymbolKind[vscode.SymbolKind.Interface]) && symbolNode.uri && symbolNode.range) {
@@ -341,7 +336,6 @@ export async function extractSemanticGraph(): Promise<CodeGraph> {
     
     // --- New: Call Hierarchy Section ---
     console.log('[SaralFlow Graph] Building call hierarchy...');
-    vscode.window.showInformationMessage('SaralFlow Graph: Building call hierarchy relationships...');
     let callHierarchyEdgesCount = 0;
     
     // Create a list of promises for concurrent execution
@@ -374,7 +368,11 @@ export async function extractSemanticGraph(): Promise<CodeGraph> {
     // --- End New Section ---
 
     console.log(`[SaralFlow Graph] Graph extraction complete. Total nodes: ${graph.nodes.size}, Total edges: ${graph.edges.length}.`);
-    vscode.window.showInformationMessage(`SaralFlow Graph: Graph built successfully! Total nodes: ${graph.nodes.size}, Total edges: ${graph.edges.length}.`);
+    // Consolidated success message at the very end
+    vscode.window.showInformationMessage(
+        `SaralFlow Graph: Successfully built graph with ${graph.nodes.size} nodes and ${graph.edges.length} edges. ` +
+        `Processed ${files.length} files.`
+    );
     return graph;
 }
 
@@ -867,20 +865,20 @@ export async function reEmbedGraphNodes() {
     }
 
     console.log('[SaralFlow Graph] Starting re-embedding of graph nodes...');
-    vscode.window.showInformationMessage('SaralFlow Graph: Re-embedding graph nodes (this may take a while)...');
 
     let reEmbeddedNodesCount = 0;
     const nodesToReEmbed: { node: INode; textToEmbed: string }[] = [];
 
-    for (const [id, node] of semanticGraph.nodes.entries()) {
-        // Only re-embed if the node doesn't have an embedding yet and has a code snippet
-        if (!node.embedding && node.codeSnippet) {
-            const textToEmbed = `${node.kind}: ${node.label}\n${node.detail || ''}\n${node.codeSnippet}`;
-            const maxEmbedTextLength = 8000;
-            const truncatedText = textToEmbed.length > maxEmbedTextLength ?
-                textToEmbed.substring(0, maxEmbedTextLength) : textToEmbed;
-            nodesToReEmbed.push({ node, textToEmbed: truncatedText });
-        }
+    // Create a filtered array of only the nodes that need re-embedding
+    const unembeddedNodes = Array.from(semanticGraph.nodes.values()).filter(node => !node.embedding && node.codeSnippet);
+
+    for (const node of unembeddedNodes) {
+        // This loop now only runs for the nodes that actually need to be processed
+        const textToEmbed = `${node.kind}: ${node.label}\n${node.detail || ''}\n${node.codeSnippet}`;
+        const maxEmbedTextLength = 8000;
+        const truncatedText = textToEmbed.length > maxEmbedTextLength ?
+            textToEmbed.substring(0, maxEmbedTextLength) : textToEmbed;
+        nodesToReEmbed.push({ node, textToEmbed: truncatedText });
     }
 
     if (nodesToReEmbed.length > 0) {
@@ -906,6 +904,5 @@ export async function reEmbedGraphNodes() {
         vscode.window.showInformationMessage(`SaralFlow Graph: Re-embedded ${reEmbeddedNodesCount} nodes.`);
     } else {
         console.log('[SaralFlow Graph] No nodes found requiring re-embedding.');
-        vscode.window.showInformationMessage('SaralFlow Graph: All nodes already have embeddings.');
     }
 }

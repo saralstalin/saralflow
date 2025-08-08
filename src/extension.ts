@@ -19,6 +19,10 @@ export let semanticGraph: CodeGraph = new CodeGraph();
 let isGraphBuilding = false;
 // Global variable to store the Firebase ID Token received from the webview
 export let firebaseIdToken: string | null = null;
+let firebaseTokenPromiseResolve: ((value: string) => void) | null = null;
+let firebaseTokenPromise = new Promise<string>(resolve => {
+    firebaseTokenPromiseResolve = resolve;
+});
 
 // Define the expected structure of the Cloud Function's response for generateCode
 interface GenerateCodeResponse {
@@ -27,8 +31,23 @@ interface GenerateCodeResponse {
     error?: string; // Error message if success is false
 }
 
-export function activate(context: vscode.ExtensionContext) {
-    extensionContext = context;
+export function activate(vsContext: vscode.ExtensionContext) {
+    extensionContext = vsContext;
+
+    // Check for a previously saved Firebase token immediately on startup
+    const checkTokenOnStartup = async () => {
+        const storedToken = await extensionContext.secrets.get('firebaseIdToken');
+        if (storedToken) {
+            firebaseIdToken = storedToken;
+            if (firebaseTokenPromiseResolve) {
+                firebaseTokenPromiseResolve(firebaseIdToken);
+            }
+            console.log('SaralFlow: Found a stored Firebase token on startup.');
+        } else {
+            console.log('SaralFlow: No stored Firebase token found.');
+        }
+    };
+    checkTokenOnStartup();
 
     // *** Initial Graph Building on Activation ***
     let buildGraphDisposable = vscode.commands.registerCommand('SaralFlow.buildGraphOnStartup', async () => {
@@ -37,11 +56,9 @@ export function activate(context: vscode.ExtensionContext) {
             return;
         }
         isGraphBuilding = true;
-        vscode.window.showInformationMessage('SaralFlow: Starting initial graph build...');
         console.log('[SaralFlow] Initial graph build triggered.');
         try {
             semanticGraph = await extractSemanticGraph(); // Build and store the graph
-            vscode.window.showInformationMessage(`SaralFlow: Graph build complete. Nodes: ${semanticGraph.nodes.size}, Edges: ${semanticGraph.edges.length}`);
             console.log('[SaralFlow] Initial graph build complete.');
 
             // If a panel is already open, update it
@@ -60,7 +77,7 @@ export function activate(context: vscode.ExtensionContext) {
             isGraphBuilding = false;
         }
     });
-    context.subscriptions.push(buildGraphDisposable);
+    extensionContext.subscriptions.push(buildGraphDisposable);
 
     // Call the graph building command immediately after activation
     vscode.commands.executeCommand('SaralFlow.buildGraphOnStartup');
@@ -98,19 +115,19 @@ export function activate(context: vscode.ExtensionContext) {
                     retainContextWhenHidden: true, // Keeps webview state when hidden
                     // Restrict local resource loading to the 'webview/dist' folder
                     // (where `cpx` will copy your webview files during build)
-                    localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview')]
+                    localResourceRoots: [vscode.Uri.joinPath(extensionContext.extensionUri, 'dist', 'webview')]
                 }
         );
 
         // Read the HTML content from your webview/index.html file
-        const htmlPath = vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview', 'index.html');
+        const htmlPath = vscode.Uri.joinPath(extensionContext.extensionUri, 'dist', 'webview', 'index.html');
         const htmlContent = (await vscode.workspace.fs.readFile(htmlPath)).toString();
 
         // Get webview-accessible URIs for your local assets (CSS, JS)
         // These will replace the {{cspSource}} placeholders in index.html
-        const styleUri = graphPanel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview', 'style.css'));
-        const scriptUri = graphPanel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview', 'main.js'));
-        const visNetworkScriptUri = graphPanel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview', 'vis-network.min.js')); // <--- THIS LINE
+        const styleUri = graphPanel.webview.asWebviewUri(vscode.Uri.joinPath(extensionContext.extensionUri, 'dist', 'webview', 'style.css'));
+        const scriptUri = graphPanel.webview.asWebviewUri(vscode.Uri.joinPath(extensionContext.extensionUri, 'dist', 'webview', 'main.js'));
+        const visNetworkScriptUri = graphPanel.webview.asWebviewUri(vscode.Uri.joinPath(extensionContext.extensionUri, 'dist', 'webview', 'vis-network.min.js')); // <--- THIS LINE
 
         // Get the Content Security Policy (CSP) source value for 'self' and VS Code specific origins.
         // This is used for the <meta http-equiv="Content-Security-Policy"> tag.
@@ -164,16 +181,16 @@ export function activate(context: vscode.ExtensionContext) {
                 }
             },
             undefined,
-            context.subscriptions
+            extensionContext.subscriptions
         );
 
         // Reset when the current panel is closed
         graphPanel.onDidDispose(() => {
             graphPanel = undefined;
-        }, null, context.subscriptions);
+        }, null, extensionContext.subscriptions);
       
     });
-    context.subscriptions.push(showGraphCommand);
+    extensionContext.subscriptions.push(showGraphCommand);
 
     // NEW: Command to query the graph based on a story/keyword
     let queryGraphCommand = vscode.commands.registerCommand('SaralFlow.queryGraphForLLM', async () => {
@@ -239,10 +256,10 @@ export function activate(context: vscode.ExtensionContext) {
 
         vscode.window.showInformationMessage(`SaralFlow: Context generated for "${query}" (see "SaralFlow LLM Context" output).`);
     });
-    context.subscriptions.push(queryGraphCommand);
+    extensionContext.subscriptions.push(queryGraphCommand);
 
 
-    context.subscriptions.push(vscode.commands.registerCommand('SaralFlow.proposeCodeFromStory', async () => {
+    extensionContext.subscriptions.push(vscode.commands.registerCommand('SaralFlow.proposeCodeFromStory', async () => {
         if (!semanticGraph || semanticGraph.nodes.size === 0) {
             vscode.window.showWarningMessage('SaralFlow: Graph not built or is empty. Please build the graph first.');
             return;
@@ -260,8 +277,8 @@ export function activate(context: vscode.ExtensionContext) {
     }));
 
     // New Command to open the Webview
-    context.subscriptions.push(vscode.commands.registerCommand('SaralFlow.openGenerator', () => {
-        openSaralFlowWebview(context.extensionUri);
+    extensionContext.subscriptions.push(vscode.commands.registerCommand('SaralFlow.openGenerator', () => {
+        openSaralFlowWebview(extensionContext.extensionUri);
     }));
 
 
@@ -272,7 +289,7 @@ export function activate(context: vscode.ExtensionContext) {
     saralCodeStatusBarItem.tooltip = 'Show Saral Code';
     saralCodeStatusBarItem.command = 'SaralFlow.openGenerator'; // Link to the new command
     saralCodeStatusBarItem.show();
-    context.subscriptions.push(saralCodeStatusBarItem);
+    extensionContext.subscriptions.push(saralCodeStatusBarItem);
 
     // Create a status bar item
     const memGraphStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
@@ -280,12 +297,12 @@ export function activate(context: vscode.ExtensionContext) {
     memGraphStatusBarItem.tooltip = 'Show Graph';
     memGraphStatusBarItem.command = 'SaralFlow.showGraph'; // Link to the new command
     memGraphStatusBarItem.show();
-    context.subscriptions.push(memGraphStatusBarItem);
+    extensionContext.subscriptions.push(memGraphStatusBarItem);
     
 
     // Add a file system watcher for code files
     const codeFileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx,cs,py,sql,yaml}', false, false, false);
-    context.subscriptions.push(codeFileWatcher);
+    extensionContext.subscriptions.push(codeFileWatcher);
 
     let graphUpdateTimeout: NodeJS.Timeout | undefined;
 
@@ -624,10 +641,18 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
             }
             switch (message.command) {
                  case 'firebaseToken':
-                        firebaseIdToken = message.token;
-                        console.log('Firebase ID Token received by extension.');
-                        await reEmbedGraphNodes();
-                        break;
+                    firebaseIdToken = message.token;
+                    if (firebaseIdToken) {
+                        extensionContext.secrets.store('firebaseIdToken', firebaseIdToken);
+                        if (firebaseTokenPromiseResolve) {
+                            firebaseTokenPromiseResolve(firebaseIdToken);
+                        }
+                    } else {
+                        extensionContext.secrets.delete('firebaseIdToken');
+                    }
+                    console.log('Firebase ID Token received by extension.');
+                    await reEmbedGraphNodes();
+                    break;
 
                 case 'generateCode':
                     // We need to ensure proposeCodeFromStory also handles codeViewPanel potentially being undefined
@@ -635,6 +660,7 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                     try {
 
                         codeViewPanel.webview.postMessage({ command: 'showLoading' });
+                        await reEmbedGraphNodes(); 
                         await proposeCodeFromStory(message.text);
                     }
                     catch (error) {
