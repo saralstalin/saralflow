@@ -85,12 +85,14 @@ file-change-container {
     padding: 15px; /* Moved padding here to give space inside the pre tag */
     margin: 0;
     box-shadow: none !important; /* Explicitly remove any box-shadow */
+    text-shadow: none !important; /* This is the new change to remove the shadow */
 }
 
 .code-editable-div code {
     background-color: transparent !important;
     color: inherit !important;
     padding: 0;
+    text-shadow: none !important; /* This is the new change to remove the shadow */
 }
 
 
@@ -144,7 +146,7 @@ input[type="password"] {
     border-radius: 4px;
     background-color: var(--vscode-input-background);
     color: var(--vscode-input-foreground);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    /* The box-shadow has been removed to avoid unwanted text effects */
 }
 
 /* Login/Register buttons */
@@ -181,7 +183,7 @@ input[type="password"] {
 .code-editable-div .token.prolog,
 .code-editable-div .token.doctype,
 .code-editable-div .token.cdata {
-    color: #6a9955; /* A distinct green for comments */
+    color: #6A9955;
 }
 
 .code-editable-div .token.punctuation {
@@ -194,7 +196,7 @@ input[type="password"] {
 .code-editable-div .token.number,
 .code-editable-div .token.constant,
 .code-editable-div .token.symbol {
-    color: #b5cea8; /* Light green for numbers and symbols */
+    color: #B5CEA8;
 }
 
 .code-editable-div .token.selector,
@@ -204,26 +206,70 @@ input[type="password"] {
 .code-editable-div .token.url,
 .code-editable-div .language-css .token.string,
 .code-editable-div .style .token.string {
-    color: #ce9178; /* Orange for strings */
+    /* Using a distinct, darker orange for strings */
+    color: #CE9178;
 }
 
 .code-editable-div .token.atrule,
 .code-editable-div .token.keyword {
-    color: #c586c0; /* Purple for keywords and at-rules */
+    color: #C586C0;
 }
 
 .code-editable-div .token.function,
 .code-editable-div .token.class-name {
-    color: #dcdcaa; /* Yellow for functions and classes */
+    /* Using a bright, clear yellow for functions and classes */
+    color: #DCDCAA;
 }
 
 .code-editable-div .token.regex,
 .code-editable-div .token.important,
 .code-editable-div .token.variable {
-    color: #9cdcfe; /* Light blue for variables */
+    /* A clearer blue for variables */
+    color: #9CDCFE;
 }
 
 .code-editable-div .token.operator,
 .code-editable-div .token.builtin {
     color: var(--vscode-editor-foreground);
+}
+
+.file-collapse-header {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    padding: 10px;
+    background-color: var(--vscode-editor-background);
+    border: 1px solid var(--vscode-editorGroup-border);
+    border-radius: 4px;
+    margin-bottom: 5px;
+    user-select: none;
+}
+
+.file-collapse-header:hover {
+    background-color: var(--vscode-list-hoverBackground);
+}
+
+.file-collapse-header .arrow {
+    margin-right: 10px;
+    transition: transform 0.2s ease-in-out;
+}
+
+.file-collapse-header.collapsed .arrow {
+    transform: rotate(0deg);
+}
+
+.file-collapse-header:not(.collapsed) .arrow {
+    transform: rotate(90deg);
+}
+
+.file-collapse-content {
+    max-height: 500px; /* A reasonable starting height, adjust as needed */
+    overflow: auto;
+    transition: max-height 0.3s ease-in-out;
+    padding: 0 10px;
+}
+
+.file-collapse-content.collapsed {
+    max-height: 0;
+    padding: 0 10px; /* Keep padding to avoid content jumping on collapse */
 }

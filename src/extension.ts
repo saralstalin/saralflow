@@ -311,8 +311,6 @@ export function activate(vsContext: vscode.ExtensionContext) {
             clearTimeout(graphUpdateTimeout);
         }
         graphUpdateTimeout = setTimeout(async () => {
-            vscode.window.showInformationMessage(`SaralFlow: File change detected in ${vscode.workspace.asRelativePath(uri)}. Updating graph...`);
-            
             // Step 1: Remove all nodes and edges for the old version of the file and get the removed edges.
             const removedEdges = removeFileNodesFromGraph(uri);
             
@@ -330,19 +328,15 @@ export function activate(vsContext: vscode.ExtensionContext) {
                     edges: semanticGraph.edges
                 });
             }
-            
-            vscode.window.showInformationMessage('SaralFlow: Graph update complete.');
-        }, 4000); // 2-second debounce
+        }, 4000); // 4-second debounce
     };
 
     // Listen for file changes, creations, and deletions
     codeFileWatcher.onDidChange(debouncedGraphUpdate);
     codeFileWatcher.onDidCreate(debouncedGraphUpdate);
     codeFileWatcher.onDidDelete(async (uri) => {
-        vscode.window.showInformationMessage(`SaralFlow: File deleted: ${vscode.workspace.asRelativePath(uri)}. Updating graph...`);
-        // Immediately remove deleted file's nodes without debounce
-        await removeFileNodesFromGraph(uri);
-        vscode.window.showInformationMessage('SaralFlow: Graph update complete.');
+    await removeFileNodesFromGraph(uri);
+
 });
 }
 
@@ -483,7 +477,7 @@ async function getCodeSnippet(node: INode): Promise<string> {
 
 async function proposeCodeFromStory(userStory: string) {
     if (!semanticGraph || !codeViewPanel) {
-        vscode.window.showErrorMessage('SaralFlow: Graph not built or Webview not active.');
+        vscode.window.showErrorMessage('SaralFlow: Semantic Graph is not built or Webview not active.');
         return;
     }
 
@@ -510,7 +504,7 @@ async function proposeCodeFromStory(userStory: string) {
         const storyEmbedding = await getEmbeddingViaCloudFunction(userStory, firebaseIdToken);
 
         if (!storyEmbedding) {
-            vscode.window.showErrorMessage('SaralFlow: Failed to generate embedding for the story. Please check your API key and try again.');
+            vscode.window.showErrorMessage('SaralFlow: Failed to embedd story.');
             codeViewPanel.webview.postMessage({ command: 'showError', text: 'Failed to generate query embedding.' });
             return;
         }
@@ -719,6 +713,7 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     const prismJsUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism.js'));
     const prismSQLUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism-sql.min.js'));
     const prismCsharpUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism-csharp.min.js'));
+    const prismPythonUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'prism-python.min.js'));
 
     // Firebase SDK URIs
     const firebaseAppUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'firebase-app-compat.js'));
@@ -739,6 +734,7 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
         .replace(/\{\{prismJsUri\}\}/g, prismJsUri.toString())
         .replace(/\{\{prismSQLUri\}\}/g, prismSQLUri.toString())
         .replace(/\{\{prismCsharpUri\}\}/g, prismCsharpUri.toString())
+        .replace(/\{\{prismPythonUri\}\}/g, prismPythonUri.toString())
         .replace(/\{\{scriptUri\}\}/g, scriptUri.toString())
         .replace(/\{\{nonce\}\}/g, nonce)
         .replace(/\{\{webview\.cspSource\}\}/g, webview.cspSource);
@@ -914,7 +910,6 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
         if (change.isNewFile) {
             edit.createFile(fileUri, { ignoreIfExists: false });
             edit.insert(fileUri, new vscode.Position(0, 0), change.content);
-            vscode.window.showInformationMessage(`Proposed new file: ${change.filePath}`);
             filesOpenedCount++;
         } else {
             try {
@@ -942,7 +937,6 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
                         currentOffset += text.length;
                     }
                 }
-                vscode.window.showInformationMessage(`Proposed changes to: ${change.filePath}`);
                 filesOpenedCount++;
 
             } catch (error: any) {

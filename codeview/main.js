@@ -256,21 +256,36 @@ function displayParsedResult(explanation, fileChanges) {
     if (fileChanges && fileChanges.length > 0) {
         resultDiv.innerHTML += `<h3>File Changes:</h3>`;
         fileChanges.forEach((change, index) => {
-            const fileContainer = document.createElement('div');
-            fileContainer.classList.add('file-change-container');
+            // Create the header for the collapsible section
+            const header = document.createElement('div');
+            header.classList.add('file-collapse-header', 'collapsed');
+            header.dataset.targetId = `file-content-${index}`;
 
+            // Create the arrow icon
+            const arrow = document.createElement('span');
+            arrow.classList.add('arrow');
+            arrow.textContent = '▶'; // Right-pointing triangle
+            header.appendChild(arrow);
+            
             // Add a checkbox for selection
             const checkbox = document.createElement('input');
             checkbox.type = 'checkbox';
             checkbox.id = `checkbox-${index}`;
             checkbox.dataset.filePath = change.filePath; // Store the file path
             checkbox.checked = true; // Default to selected
-
+            
             const fileLabel = document.createElement('label');
             fileLabel.htmlFor = `checkbox-${index}`;
             fileLabel.textContent = ` ${change.filePath} (${change.isNewFile ? 'New File' : 'Edit'})`;
 
-            // Create an editable div for the code
+            header.appendChild(checkbox);
+            header.appendChild(fileLabel);
+
+            // Create an editable div for the code content
+            const codeContent = document.createElement('div');
+            codeContent.id = `file-content-${index}`;
+            codeContent.classList.add('file-collapse-content', 'collapsed');
+
             const codeEditableDiv = document.createElement('div');
             codeEditableDiv.classList.add('code-editable-div');
             codeEditableDiv.setAttribute('contenteditable', 'true');
@@ -282,14 +297,19 @@ function displayParsedResult(explanation, fileChanges) {
             // Use innerHTML to allow Prism.js to render syntax highlighting
             codeEditableDiv.innerHTML = `<pre><code class="language-${languageClass}">${escapeHtml(change.content)}</code></pre>`;
 
-            fileContainer.appendChild(checkbox);
-            fileContainer.appendChild(fileLabel);
-            fileContainer.appendChild(codeEditableDiv);
-            resultDiv.appendChild(fileContainer);
+            codeContent.appendChild(codeEditableDiv);
+            
+            // Append the new elements to the result container
+            resultDiv.appendChild(header);
+            resultDiv.appendChild(codeContent);
 
+            // Add the click event listener to the header
+            header.addEventListener('click', () => {
+                header.classList.toggle('collapsed');
+                codeContent.classList.toggle('collapsed');
+            });
+            
             // Trigger Prism.js highlighting after the element is in the DOM
-            // This is a simple way to highlight, but for real-time highlighting on edit,
-            // a more complex solution like CodeMirror would be needed.
             if (languageClass) {
                 const codeElement = codeEditableDiv.querySelector('code');
                 if (codeElement && typeof Prism !== 'undefined') {
