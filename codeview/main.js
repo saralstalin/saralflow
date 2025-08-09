@@ -256,6 +256,11 @@ function displayParsedResult(explanation, fileChanges) {
     if (fileChanges && fileChanges.length > 0) {
         resultDiv.innerHTML += `<h3>File Changes:</h3>`;
         fileChanges.forEach((change, index) => {
+
+            // Create the main container for the file change
+            const fileChangeContainer = document.createElement('div');
+            fileChangeContainer.classList.add('file-change-container');
+
             // Create the header for the collapsible section
             const header = document.createElement('div');
             header.classList.add('file-collapse-header', 'collapsed');
@@ -299,9 +304,10 @@ function displayParsedResult(explanation, fileChanges) {
 
             codeContent.appendChild(codeEditableDiv);
             
-            // Append the new elements to the result container
-            resultDiv.appendChild(header);
-            resultDiv.appendChild(codeContent);
+            // Append the new elements to the fileChangeContainer
+            fileChangeContainer.appendChild(header);
+            fileChangeContainer.appendChild(codeContent);
+            resultDiv.appendChild(fileChangeContainer);
 
             // Add the click event listener to the header
             header.addEventListener('click', () => {

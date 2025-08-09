@@ -20,9 +20,7 @@ let isGraphBuilding = false;
 // Global variable to store the Firebase ID Token received from the webview
 export let firebaseIdToken: string | null = null;
 let firebaseTokenPromiseResolve: ((value: string) => void) | null = null;
-let firebaseTokenPromise = new Promise<string>(resolve => {
-    firebaseTokenPromiseResolve = resolve;
-});
+
 
 // Define the expected structure of the Cloud Function's response for generateCode
 interface GenerateCodeResponse {
@@ -165,19 +163,6 @@ export function activate(vsContext: vscode.ExtensionContext) {
                             console.error("SaralFlow: Webview panel is not open. Cannot render graph.");
                         }
                         break; // Add break to prevent fall-through
-                    case 'nodeClicked':
-                        /* console.log('Node clicked in webview:', message.nodeId);
-                        // Example: Open the document and highlight the range of the clicked node
-                        const clickedNode = currentGraph.getNode(message.nodeId);
-                        if (clickedNode) {
-                            vscode.workspace.openTextDocument(clickedNode.uri).then(document => {
-                                vscode.window.showTextDocument(document, { selection: clickedNode.range, preview: true, preserveFocus: true });
-                            }).then(undefined, err => {
-                                console.error('Error opening document for clicked node:', err);
-                                vscode.window.showErrorMessage(`Could not open document for ${clickedNode.label}: ${err.message}`);
-                            });
-                        }*/
-                        return;
                 }
             },
             undefined,
@@ -285,19 +270,19 @@ export function activate(vsContext: vscode.ExtensionContext) {
 
     // Create a status bar item
     const saralCodeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
-    saralCodeStatusBarItem.text = `$(robot) SaralCode`;
-    saralCodeStatusBarItem.tooltip = 'Show Saral Code';
+    saralCodeStatusBarItem.text = `$(robot) Saralflow`;
+    saralCodeStatusBarItem.tooltip = 'Show Saral flow';
     saralCodeStatusBarItem.command = 'SaralFlow.openGenerator'; // Link to the new command
     saralCodeStatusBarItem.show();
     extensionContext.subscriptions.push(saralCodeStatusBarItem);
 
     // Create a status bar item
-    const memGraphStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+    /*const memGraphStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
     memGraphStatusBarItem.text = `$(robot) SaralGraph`;
     memGraphStatusBarItem.tooltip = 'Show Graph';
     memGraphStatusBarItem.command = 'SaralFlow.showGraph'; // Link to the new command
     memGraphStatusBarItem.show();
-    extensionContext.subscriptions.push(memGraphStatusBarItem);
+    extensionContext.subscriptions.push(memGraphStatusBarItem);*/
     
 
     // Add a file system watcher for code files
