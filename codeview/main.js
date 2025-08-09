@@ -1,7 +1,4 @@
-console.log('main.js loaded.');
-
 const vscode = acquireVsCodeApi();
-
 const authSection = document.getElementById('auth-section');
 const appSection = document.getElementById('app-section');
 const emailInput = document.getElementById('emailInput');
@@ -20,10 +17,18 @@ applySelectedButton.id = 'applySelectedButton';
 applySelectedButton.textContent = 'Apply Changes';
 applySelectedButton.style.display = 'none';
 
+const applyStatusMessage = document.createElement('p');
+applyStatusMessage.id = 'applyStatusMessage';
+applyStatusMessage.style.display = 'none';
+applyStatusMessage.style.marginTop = '10px';
+applyStatusMessage.style.color = 'var(--vscode-editor-foreground)';
+
 if (resultDiv) {
     resultDiv.after(applySelectedButton);
+    resultDiv.after(applyStatusMessage);
 } else {
     document.body.appendChild(applySelectedButton);
+    document.body.appendChild(applyStatusMessage);
 }
 
 // --- Firebase Initialization (Add your Firebase Config here) ---
@@ -140,6 +145,11 @@ applySelectedButton.addEventListener('click', () => {
         selectedChanges.push({ filePath, content: editedContent, isNewFile });
     });
     if (selectedChanges.length > 0) {
+        // Hide the apply button and show the "Applying changes..." message
+        applySelectedButton.style.display = 'none';
+        applyStatusMessage.style.display = 'block';
+        applyStatusMessage.textContent = 'Applying changes...';
+        applyStatusMessage.style.color = 'var(--vscode-editor-foreground)';
         vscode.postMessage({ command: 'applySelectedChanges', changes: selectedChanges });
     } else {
         vscode.postMessage({ command: 'showError', text: 'Please select at least one change to apply.' });
@@ -160,6 +170,7 @@ generateButton.addEventListener('click', () => {
         resultDiv.innerHTML = '';
         loadingMessage.classList.remove('hidden');
         applySelectedButton.style.display = 'none';
+        applyStatusMessage.style.display = 'none';
         vscode.postMessage({ command: 'generateCode', text: userStory });
     }
 });
@@ -223,6 +234,12 @@ window.addEventListener('message', async event => {
                 console.error('Firebase Custom Token Sign-in Error:', error);
             }
             break;
+        case 'changesApplied':
+            applySelectedButton.style.display = 'none';
+            applyStatusMessage.textContent = 'Code changes applied successfully!';
+            applyStatusMessage.style.color = 'green';
+            applyStatusMessage.style.display = 'block';
+            break;
         default:
             console.warn('Unknown command received:', message.command, message);
             break;
@@ -246,6 +263,7 @@ function displayParsedResult(explanation, fileChanges) {
 
     // Clear previous results
     resultDiv.innerHTML = '';
+    applyStatusMessage.style.display = 'none';
     applySelectedButton.style.display = 'block';
 
     if (explanation) {

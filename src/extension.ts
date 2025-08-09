@@ -940,20 +940,11 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
     // Apply the combined edit
     const success = await vscode.workspace.applyEdit(edit);
 
-    if (success) {
-        vscode.window.showInformationMessage('SaralFlow: Code changes applied successfully!');
-        // Optional: Open all modified/new files in editor
-        /*for (const change of changesToApply) {
-            const fullPath = path.join(rootPath, change.filePath);
-            const fileUri = vscode.Uri.file(fullPath);
-            try {
-                const doc = await vscode.workspace.openTextDocument(fileUri);
-                await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: false });
-            } catch (e) {
-                console.warn(`Could not open file ${change.filePath}: ${e}`);
-            }
-        }*/
-    } else {
+    if (success && codeViewPanel) {
+    codeViewPanel.webview.postMessage({ command: 'changesApplied' });
+    vscode.window.showInformationMessage('SaralFlow: Code changes applied successfully!');
+    }  
+    else {
         vscode.window.showErrorMessage('SaralFlow: Failed to apply code changes.');
     }
 }
