@@ -941,8 +941,8 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
     const success = await vscode.workspace.applyEdit(edit);
 
     if (success && codeViewPanel) {
-    codeViewPanel.webview.postMessage({ command: 'changesApplied' });
-    vscode.window.showInformationMessage('SaralFlow: Code changes applied successfully!');
+        codeViewPanel.webview.postMessage({ command: 'changesApplied' });
+        vscode.window.showInformationMessage('SaralFlow: Code changes applied successfully!');
     }  
     else {
         vscode.window.showErrorMessage('SaralFlow: Failed to apply code changes.');

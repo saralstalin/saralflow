@@ -2,7 +2,7 @@
   "name": "saralflow",
   "displayName": "SaralFlow",
   "description": "Auto generate code changes from story description",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "engines": {
     "vscode": "^1.102.0"
   },
@@ -86,5 +86,9 @@
     "marked": "^16.1.1",
     "node-fetch": "^2.7.0",
     "openai": "^5.10.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saralstalin/saralflow.git"
   }
 }
