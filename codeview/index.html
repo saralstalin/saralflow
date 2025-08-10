@@ -19,6 +19,10 @@
             <label for="passwordInput">Password</label>
             <input type="password" id="passwordInput" placeholder="Password" />
         </div>
+         <div class="input-group hidden" id="confirmPasswordGroup">
+            <label for="confirmPasswordInput">Confirm Password</label>
+            <input type="password" id="confirmPasswordInput" placeholder="Confirm Password" />
+        </div>
         <div class="auth-buttons">
             <button id="loginButton">Login</button>
             <button id="registerButton">Register</button>
@@ -26,6 +30,9 @@
         <p id="authStatus"></p>
     </div>
     <div id="app-section" class="hidden">
+        <div class="user-info">
+            <p>Welcome, <span id="userName"></span>! <a href="#" id="logoutButton">Logout</a></p>
+        </div>
         <p>Describe the feature or change you want to implement:</p>
         <textarea id="userStory" rows="10" cols="60" placeholder="e.g., 'As a user, I want to add a new API endpoint that lists all products with a 'special' tag.'"></textarea>
         <br>

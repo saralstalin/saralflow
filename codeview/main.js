@@ -4,8 +4,9 @@ const appSection = document.getElementById('app-section');
 const emailInput = document.getElementById('emailInput');
 const passwordInput = document.getElementById('passwordInput');
 const loginButton = document.getElementById('loginButton');
-const registerButton = document.getElementById('registerButton'); // New registration button
+const registerButton = document.getElementById('registerButton'); 
 const authStatus = document.getElementById('authStatus');
+const confirmPasswordInput = document.getElementById('confirmPasswordInput');
 
 const userStoryTextArea = document.getElementById('userStory');
 const generateButton = document.getElementById('generateButton');
@@ -23,6 +24,11 @@ applyStatusMessage.style.display = 'none';
 applyStatusMessage.style.marginTop = '10px';
 applyStatusMessage.style.color = 'var(--vscode-editor-foreground)';
 
+const userNameSpan = document.getElementById('userName');
+const logoutButton = document.getElementById('logoutButton');
+
+let isRegisterMode = false;
+
 if (resultDiv) {
     resultDiv.after(applySelectedButton);
     resultDiv.after(applyStatusMessage);
@@ -31,7 +37,7 @@ if (resultDiv) {
     document.body.appendChild(applyStatusMessage);
 }
 
-// --- Firebase Initialization (Add your Firebase Config here) ---
+// --- Firebase Initialization
 const firebaseConfig = {
   apiKey: "AIzaSyD-ufVjCUr7Ub_7arhrW5tqwfk9N_QPsfw",
   authDomain: "saralflowapis.firebaseapp.com",
@@ -48,8 +54,22 @@ const provider = new firebase.auth.GoogleAuthProvider(); // Google Auth Provider
 
 let firebaseIdToken = null;
 
+if (auth) {
+    auth.onAuthStateChanged(user => {
+        if (user) {
+            authSection.classList.add('hidden');
+            appSection.classList.remove('hidden');
+            // Display the user's email
+            userNameSpan.textContent = user.email;
+        } else {
+            authSection.classList.remove('hidden');
+            appSection.classList.add('hidden');
+            // Clear the user's info
+            userNameSpan.textContent = '';
+        }
+    });
+}
 
-// Existing login listener
 loginButton.addEventListener('click', async () => {
     const email = emailInput.value;
     const password = passwordInput.value;
@@ -77,33 +97,71 @@ loginButton.addEventListener('click', async () => {
 
 
 
-// NEW: Registration listener
-registerButton.addEventListener('click', async () => {
-    const email = emailInput.value;
-    const password = passwordInput.value;
+// Handle Register Button Click
+if (registerButton) {
+    registerButton.addEventListener('click', async () => {
+        // First click shows the confirm password field
+        if (!isRegisterMode) {
+            confirmPasswordGroup.classList.remove('hidden');
+            isRegisterMode = true;
+            registerButton.textContent = 'Confirm Registration'; // Change button text
+            authStatus.textContent = 'Please confirm your password.'; // Prompt user
+            return;
+        }
 
-    if (!email || !password) {
-        authStatus.textContent = 'Please enter both email and password to register.';
-        return;
-    }
+        // Second click performs the registration
+        const email = emailInput.value;
+        const password = passwordInput.value;
+        const confirmPassword = confirmPasswordInput.value;
 
-    if (!isValidEmail(email)) {
-        authStatus.textContent = 'Please enter a valid email address.';
-        return;
-    }
-    
-    authStatus.textContent = 'Registering user...';
+        if (!isValidEmail(email)) {
+            authStatus.textContent = 'Please enter a valid email address.';
+            return;
+        }
 
-    try {
-        const userCredential = await auth.createUserWithEmailAndPassword(email, password);
-        authStatus.textContent = `Registration successful! Logged in as ${userCredential.user.email}.`;
-        handleSuccessfulAuth(userCredential.user);
-    } catch (error) {
-        authStatus.textContent = `Registration failed: ${error.message}`;
-        console.error('Firebase Registration Error:', error);
-    }
-});
+        if (password.length < 6) {
+            authStatus.textContent = 'Password should be at least 6 characters.';
+            return;
+        }
 
+        // Check if passwords match
+        if (password !== confirmPassword) {
+            authStatus.textContent = 'Passwords do not match!';
+            return;
+        }
+
+        try {
+            authStatus.textContent = 'Registering...';
+            const userCredential = await auth.createUserWithEmailAndPassword(email, password);
+            handleSuccessfulAuth(userCredential.user);
+            authStatus.textContent = 'Registration successful! You are now logged in.';
+            // Clear inputs after successful registration
+            emailInput.value = '';
+            passwordInput.value = '';
+            confirmPasswordInput.value = '';
+            // Reset to login mode
+            confirmPasswordGroup.classList.add('hidden');
+            isRegisterMode = false;
+            registerButton.textContent = 'Register';
+        } catch (error) {
+            authStatus.textContent = `Registration failed: ${error.message}`;
+            console.error('Registration failed:', error);
+        }
+    });
+}
+
+// Handle Logout Button Click
+if (logoutButton) {
+    logoutButton.addEventListener('click', async () => {
+        try {
+            await auth.signOut();
+            console.log('User signed out.');
+            // authStateChanged listener will handle UI changes
+        } catch (error) {
+            console.error('Logout failed:', error);
+        }
+    });
+}
 
 
 
