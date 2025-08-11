@@ -6,7 +6,7 @@ import pLimit from 'p-limit';
 
 // Tunable concurrency limits 
 const DEFAULT_CONCURRENCY = 8; // lower to avoid LSP overload
-const EMBEDDING_CONCURRENCY = 4;
+const EMBEDDING_CONCURRENCY = 8;
 const initialLSPWaitTimeMs = 10_000;
 
 // Global caches used only during a single extractSemanticGraph run
