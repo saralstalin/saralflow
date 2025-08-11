@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { CodeGraph,  INode } from './graphTypes'; 
 import { getEmbeddingViaCloudFunction, cosineSimilarity } from'./embeddingService';
-import {extractSemanticGraph,  processFileAndAddToGraph, removeFileNodesFromGraph, rebuildAffectedReferences, reEmbedGraphNodes} from './graphBuilder';
+import {extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes} from './graphBuilder';
 const config = vscode.workspace.getConfiguration('saralflow');
 
 const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeUrl') 
@@ -290,22 +290,23 @@ export function activate(vsContext: vscode.ExtensionContext) {
     extensionContext.subscriptions.push(codeFileWatcher);
 
     let graphUpdateTimeout: NodeJS.Timeout | undefined;
+    const changedUris = new Set<vscode.Uri>();
 
     const debouncedGraphUpdate = (uri: vscode.Uri) => {
+        changedUris.add(uri);
+
         if (graphUpdateTimeout) {
             clearTimeout(graphUpdateTimeout);
         }
         graphUpdateTimeout = setTimeout(async () => {
-            // Step 1: Remove all nodes and edges for the old version of the file and get the removed edges.
-            const removedEdges = removeFileNodesFromGraph(uri);
+            const urisToProcess = Array.from(changedUris);
+            console.log(`[SaralFlow Graph] Debounce triggered. Processing ${urisToProcess.length} files.`);
             
-            // Step 2: Process the file and add the new nodes and internal ('CONTAINS') edges.
-            const newNodesInFile = await processFileAndAddToGraph(uri);
+            await extractSemanticGraph(urisToProcess);
+            
+            // Clear the set for the next batch of changes
+            changedUris.clear();
 
-            // Step 3: Rebuild relationships only for the affected nodes (removed and newly added).
-            await rebuildAffectedReferences(removedEdges, newNodesInFile);
-            
-            // Step 4: Optional - update the webview if it's open
             if (graphPanel) {
                 graphPanel.webview.postMessage({
                     command: 'renderGraph',
