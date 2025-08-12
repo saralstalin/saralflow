@@ -37,7 +37,7 @@ if (resultDiv) {
     document.body.appendChild(applyStatusMessage);
 }
 
-// --- Firebase Initialization
+// --- Firebase Initialization ---
 const firebaseConfig = {
   apiKey: "AIzaSyD-ufVjCUr7Ub_7arhrW5tqwfk9N_QPsfw",
   authDomain: "saralflowapis.firebaseapp.com",
@@ -50,26 +50,57 @@ const firebaseConfig = {
 
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
-const provider = new firebase.auth.GoogleAuthProvider(); // Google Auth Provider
+const provider = new firebase.auth.GoogleAuthProvider();
 
 let firebaseIdToken = null;
+let tokenRefreshInterval = null; // For forced refresh
 
-if (auth) {
-    auth.onAuthStateChanged(user => {
-        if (user) {
-            authSection.classList.add('hidden');
-            appSection.classList.remove('hidden');
-            // Display the user's email
-            userNameSpan.textContent = user.email;
-        } else {
-            authSection.classList.remove('hidden');
-            appSection.classList.add('hidden');
-            // Clear the user's info
-            userNameSpan.textContent = '';
-        }
-    });
+// --- Unified auth state & token change handler ---
+function updateUIForUser(user) {
+    if (user) {
+        authSection.classList.add('hidden');
+        appSection.classList.remove('hidden');
+        userNameSpan.textContent = user.email || '';
+    } else {
+        authSection.classList.remove('hidden');
+        appSection.classList.add('hidden');
+        userNameSpan.textContent = '';
+    }
 }
 
+// Automatically update token whenever Firebase refreshes it
+auth.onIdTokenChanged(async (user) => {
+    if (user) {
+        try {
+            firebaseIdToken = await user.getIdToken();
+            console.log("Updated Firebase ID Token:", firebaseIdToken);
+            updateUIForUser(user);
+            vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
+
+            // Start periodic forced refresh (every 50 minutes)
+            if (tokenRefreshInterval) {clearInterval(tokenRefreshInterval);}
+            tokenRefreshInterval = setInterval(async () => {
+                try {
+                    firebaseIdToken = await user.getIdToken(true);
+                    console.log("Forced token refresh successful:", firebaseIdToken);
+                    vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
+                } catch (err) {
+                    console.error("Forced token refresh failed:", err);
+                }
+            }, 50 * 60 * 1000); // 50 minutes
+
+        } catch (err) {
+            console.error("Error getting Firebase token:", err);
+        }
+    } else {
+        firebaseIdToken = null;
+        updateUIForUser(null);
+        authStatus.textContent = 'Please log in or register.';
+        if (tokenRefreshInterval) {clearInterval(tokenRefreshInterval);}
+    }
+});
+
+// --- Login Button Click ---
 loginButton.addEventListener('click', async () => {
     const email = emailInput.value;
     const password = passwordInput.value;
@@ -87,29 +118,25 @@ loginButton.addEventListener('click', async () => {
     authStatus.textContent = 'Logging in...';
 
     try {
-        const userCredential = await auth.signInWithEmailAndPassword(email, password);
-        handleSuccessfulAuth(userCredential.user);
+        await auth.signInWithEmailAndPassword(email, password);
+        // Token updates handled by onIdTokenChanged
     } catch (error) {
         authStatus.textContent = `Login failed, Please re-check email/password. If you are new user, click on register instead.`;
         console.error('Firebase Login Error:', error);
     }
 });
 
-
-
 // Handle Register Button Click
 if (registerButton) {
     registerButton.addEventListener('click', async () => {
-        // First click shows the confirm password field
         if (!isRegisterMode) {
             confirmPasswordGroup.classList.remove('hidden');
             isRegisterMode = true;
-            registerButton.textContent = 'Confirm Registration'; // Change button text
-            authStatus.textContent = 'Please confirm your password.'; // Prompt user
+            registerButton.textContent = 'Confirm Registration';
+            authStatus.textContent = 'Please confirm your password.';
             return;
         }
 
-        // Second click performs the registration
         const email = emailInput.value;
         const password = passwordInput.value;
         const confirmPassword = confirmPasswordInput.value;
@@ -124,7 +151,6 @@ if (registerButton) {
             return;
         }
 
-        // Check if passwords match
         if (password !== confirmPassword) {
             authStatus.textContent = 'Passwords do not match!';
             return;
@@ -132,14 +158,11 @@ if (registerButton) {
 
         try {
             authStatus.textContent = 'Registering...';
-            const userCredential = await auth.createUserWithEmailAndPassword(email, password);
-            handleSuccessfulAuth(userCredential.user);
+            await auth.createUserWithEmailAndPassword(email, password);
             authStatus.textContent = 'Registration successful! You are now logged in.';
-            // Clear inputs after successful registration
             emailInput.value = '';
             passwordInput.value = '';
             confirmPasswordInput.value = '';
-            // Reset to login mode
             confirmPasswordGroup.classList.add('hidden');
             isRegisterMode = false;
             registerButton.textContent = 'Register';
@@ -156,41 +179,11 @@ if (logoutButton) {
         try {
             await auth.signOut();
             console.log('User signed out.');
-            // authStateChanged listener will handle UI changes
         } catch (error) {
             console.error('Logout failed:', error);
         }
     });
 }
-
-
-
-// New helper function to handle successful authentication
-async function handleSuccessfulAuth(user) {
-    firebaseIdToken = await user.getIdToken();
-    console.log('Firebase ID Token obtained:', firebaseIdToken);
-    
-    authSection.classList.add('hidden');
-    appSection.classList.remove('hidden');
-    
-    vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
-}
-
-// Initial check for existing login state
-auth.onAuthStateChanged(async (user) => {
-    if (user) {
-        firebaseIdToken = await user.getIdToken();
-        authStatus.textContent = `Already logged in as ${user.email || user.displayName}!`;
-        authSection.classList.add('hidden');
-        appSection.classList.remove('hidden');
-        vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
-    } else {
-        authStatus.textContent = 'Please log in or register.';
-        authSection.classList.remove('hidden');
-        appSection.classList.add('hidden');
-    }
-});
-
 
 applySelectedButton.addEventListener('click', () => {
     console.log('Apply Selected Changes button clicked.');
@@ -203,7 +196,6 @@ applySelectedButton.addEventListener('click', () => {
         selectedChanges.push({ filePath, content: editedContent, isNewFile });
     });
     if (selectedChanges.length > 0) {
-        // Hide the apply button and show the "Applying changes..." message
         applySelectedButton.style.display = 'none';
         applyStatusMessage.style.display = 'block';
         applyStatusMessage.textContent = 'Applying changes...';
@@ -215,7 +207,6 @@ applySelectedButton.addEventListener('click', () => {
 });
 
 generateButton.addEventListener('click', () => {
-    
     const userStory = userStoryTextArea.value;
 
     if (!firebaseIdToken) {
@@ -224,7 +215,6 @@ generateButton.addEventListener('click', () => {
     }
     
     if (userStory) {
-        // Clear previous results and show loading message
         resultDiv.innerHTML = '';
         loadingMessage.classList.remove('hidden');
         applySelectedButton.style.display = 'none';
@@ -233,28 +223,18 @@ generateButton.addEventListener('click', () => {
     }
 });
 
-// Helper function to get the language class from a file path
 function getLanguageFromPath(filePath) {
     const extension = filePath.split('.').pop().toLowerCase();
     switch (extension) {
-        case 'ts':
-            return 'typescript';
-        case 'js':
-            return 'javascript';
-        case 'html':
-            return 'html';
-        case 'css':
-            return 'css';
-        case 'sql':
-            return 'sql';
-        case 'json':
-            return 'json';
-        case 'md':
-            return 'markdown';
-        case 'cs':
-            return 'csharp';
-        default:
-            return 'clike'; // A generic fallback for Prism.js
+        case 'ts': return 'typescript';
+        case 'js': return 'javascript';
+        case 'html': return 'html';
+        case 'css': return 'css';
+        case 'sql': return 'sql';
+        case 'json': return 'json';
+        case 'md': return 'markdown';
+        case 'cs': return 'csharp';
+        default: return 'clike';
     }
 }
 
@@ -262,7 +242,6 @@ window.addEventListener('message', async event => {
     const message = event.data;
     switch (message.command) {
         case 'displayParsedResult':
-            // Call the new function to display the results
             displayParsedResult(message.explanation, message.fileChanges);
             break;
         case 'showLoading':
@@ -283,9 +262,7 @@ window.addEventListener('message', async event => {
             break;
         case 'firebaseCustomToken':
             try {
-                // Use the custom token to sign in to Firebase
-                const userCredential = await auth.signInWithCustomToken(message.token);
-                handleSuccessfulAuth(userCredential.user);
+                await auth.signInWithCustomToken(message.token);
             } catch (error) {
                 authStatus.textContent = `Google Sign-in failed: ${error.message}`;
                 authStatus.style.color = 'red';
@@ -304,8 +281,6 @@ window.addEventListener('message', async event => {
     }
 });
 
-
-// Helper function to escape HTML for displaying raw code safely
 function escapeHtml(unsafe) {
     return unsafe
         .replace(/&/g, "&amp;")
@@ -315,45 +290,36 @@ function escapeHtml(unsafe) {
         .replace(/'/g, "&#039;");
 }
 
-// Function to display the parsed result with editable and highlighted code blocks
 function displayParsedResult(explanation, fileChanges) {
     console.log('Command: displayParsedResult', { explanation, fileChanges });
-
-    // Clear previous results
     resultDiv.innerHTML = '';
     applyStatusMessage.style.display = 'none';
     applySelectedButton.style.display = 'block';
 
     if (explanation) {
-        // Display the explanation using markdown
         resultDiv.innerHTML += `<h3>Explanation:</h3><div class="explanation-text">${marked.parse(explanation)}</div>`;
     }
 
     if (fileChanges && fileChanges.length > 0) {
         resultDiv.innerHTML += `<h3>File Changes:</h3>`;
         fileChanges.forEach((change, index) => {
-
-            // Create the main container for the file change
             const fileChangeContainer = document.createElement('div');
             fileChangeContainer.classList.add('file-change-container');
 
-            // Create the header for the collapsible section
             const header = document.createElement('div');
             header.classList.add('file-collapse-header', 'collapsed');
             header.dataset.targetId = `file-content-${index}`;
 
-            // Create the arrow icon
             const arrow = document.createElement('span');
             arrow.classList.add('arrow');
-            arrow.textContent = '▶'; // Right-pointing triangle
+            arrow.textContent = '▶';
             header.appendChild(arrow);
             
-            // Add a checkbox for selection
             const checkbox = document.createElement('input');
             checkbox.type = 'checkbox';
             checkbox.id = `checkbox-${index}`;
-            checkbox.dataset.filePath = change.filePath; // Store the file path
-            checkbox.checked = true; // Default to selected
+            checkbox.dataset.filePath = change.filePath;
+            checkbox.checked = true;
             
             const fileLabel = document.createElement('label');
             fileLabel.htmlFor = `checkbox-${index}`;
@@ -362,7 +328,6 @@ function displayParsedResult(explanation, fileChanges) {
             header.appendChild(checkbox);
             header.appendChild(fileLabel);
 
-            // Create an editable div for the code content
             const codeContent = document.createElement('div');
             codeContent.id = `file-content-${index}`;
             codeContent.classList.add('file-collapse-content', 'collapsed');
@@ -372,26 +337,19 @@ function displayParsedResult(explanation, fileChanges) {
             codeEditableDiv.setAttribute('contenteditable', 'true');
             codeEditableDiv.dataset.filePath = change.filePath;
 
-            // Get the language class dynamically
             const languageClass = getLanguageFromPath(change.filePath);
-
-            // Use innerHTML to allow Prism.js to render syntax highlighting
             codeEditableDiv.innerHTML = `<pre><code class="language-${languageClass}">${escapeHtml(change.content)}</code></pre>`;
 
             codeContent.appendChild(codeEditableDiv);
-            
-            // Append the new elements to the fileChangeContainer
             fileChangeContainer.appendChild(header);
             fileChangeContainer.appendChild(codeContent);
             resultDiv.appendChild(fileChangeContainer);
 
-            // Add the click event listener to the header
             header.addEventListener('click', () => {
                 header.classList.toggle('collapsed');
                 codeContent.classList.toggle('collapsed');
             });
             
-            // Trigger Prism.js highlighting after the element is in the DOM
             if (languageClass) {
                 const codeElement = codeEditableDiv.querySelector('code');
                 if (codeElement && typeof Prism !== 'undefined') {
@@ -404,22 +362,18 @@ function displayParsedResult(explanation, fileChanges) {
     }
 }
 
-// Final check for marked.js availability on load
 window.onload = () => {
     console.log('Webview window loaded. Final marked.js check:', typeof marked);
     if (typeof marked === 'undefined') {
         console.error('marked.js is not loaded.');
         document.getElementById('result').innerHTML = `<p style="color: red;">Error: marked.js failed to load. Markdown content will not be rendered correctly.</p>`;
     }
-    // Also check for prism.js
     if (typeof Prism === 'undefined') {
         console.error('Prism.js is not loaded.');
     }
 };
 
-// Function to validate email format
 function isValidEmail(email) {
-    // A basic regex for email validation
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     return emailRegex.test(email);
 }
