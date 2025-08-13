@@ -669,7 +669,12 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                         vscode.window.showWarningMessage('No selected changes to apply.');
                     }
                     break;
-                
+                case 'showDiff':
+                    const leftUri = vscode.Uri.file(path.join(vscode.workspace.rootPath || '', message.filePath));
+                    const rightDoc = await vscode.workspace.openTextDocument({ content: message.newContent, language:message.language });
+                    const rightUri = rightDoc.uri;
+                    vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `Preview Diff: ${message.filePath}`);
+                    break;
             }
         },
         undefined, // This 'thisArg' is optional
@@ -769,7 +774,7 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
     // These markers are expected from the LLM
     const startFileMarker = '--- START FILE: ';
     const endFileMarker = '--- END FILE: ';
-    const explanationStart = 'Explanation:';
+    const explanationStart = '--- Explanation:';
     const explanationEnd = '--- END EXPLANATION ---'; // New marker for the end of the explanation
     const codeBlockRegex = /^\s*```.*/;
 
@@ -949,4 +954,3 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
         vscode.window.showErrorMessage('SaralFlow: Failed to apply code changes.');
     }
 }
-

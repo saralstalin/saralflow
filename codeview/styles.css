@@ -273,3 +273,20 @@ input[type="password"] {
     max-height: 0;
     padding: 0 10px; /* Keep padding to avoid content jumping on collapse */
 }
+
+/* Diff button style */
+.diff-button {
+    background: none;
+    border: none;
+    color: #007acc; /* VS Code blue */
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0;
+    margin-left: 8px;
+    visibility: hidden; /* hidden by default */
+}
+
+.file-change-container:hover .diff-button {
+    visibility: visible; /* show on hover */
+}
+

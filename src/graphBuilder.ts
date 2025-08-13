@@ -20,6 +20,11 @@ function escapeRegexLiteral(s: string) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Common search patterns for workspace files
+const FILE_EXTENSIONS = ['ts', 'tsx', 'js', 'jsx', 'cs', 'py', 'sql', 'json', 'md', 'ipynb']; // ipynb last
+const EXCLUDE_GLOBS = '{**/node_modules/**,**/bin/**,**/obj/**,**/__pycache__/**,**/.venv/**}';
+
+
 /**
  * Finds the ID of the innermost symbol that contains the given position in a specific file.
  * Uses binary search over pre-sorted symbols for performance.
@@ -79,7 +84,11 @@ export async function extractSemanticGraph(filesToProcess?: vscode.Uri[]): Promi
     } else {
         console.log('[SaralFlow Graph] Starting full graph extraction...');
         await new Promise(resolve => setTimeout(resolve, initialLSPWaitTimeMs));
-        const files = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,cs,py,sql}', '{**/node_modules/**,**/bin/**,**/obj/**,**/__pycache__/**,**/.venv/**}');
+        // Get all matching files in the workspace
+        let files = await vscode.workspace.findFiles(
+            `**/*.{${FILE_EXTENSIONS.join(',')}}`,
+            EXCLUDE_GLOBS
+        );
         if (files.length === 0) {
             return graph;
         }
@@ -284,7 +293,10 @@ async function findCrossFileRelationshipsManually(graph: CodeGraph, nodesToSearc
     const combined = new RegExp(`\\b(${labels.join('|')})\\b`, 'g');
 
     // Get all workspace files once
-    const allWorkspaceFiles = await vscode.workspace.findFiles('**/*.{ts,tsx,js,jsx,cs,py,sql}', '{**/node_modules/**,**/bin/**,**/obj/**,**/__pycache__/**,**/.venv/**}');
+    let allWorkspaceFiles = await vscode.workspace.findFiles(
+        `**/*.{${FILE_EXTENSIONS.join(',')}}`,
+        EXCLUDE_GLOBS
+    );
 
     // Process each file once — streaming matches and mapping back to nodes
     const limit = pLimit(DEFAULT_CONCURRENCY);

@@ -206,11 +206,18 @@ applySelectedButton.addEventListener('click', () => {
     }
 });
 
-generateButton.addEventListener('click', () => {
+generateButton.addEventListener('click', async () => {
     const userStory = userStoryTextArea.value;
 
     if (!firebaseIdToken) {
         vscode.postMessage({ command: 'showError', text: 'Please log in to Firebase first.' });
+        return;
+    }
+
+    try {
+        firebaseIdToken = await auth.currentUser.getIdToken(true);
+    } catch (err) {
+        vscode.postMessage({ command: 'showError', text: 'Failed to refresh authentication token. Please log in again.' });
         return;
     }
     
@@ -327,6 +334,21 @@ function displayParsedResult(explanation, fileChanges) {
 
             header.appendChild(checkbox);
             header.appendChild(fileLabel);
+            if (!change.isNewFile) {
+                const diffButton = document.createElement('button');
+                diffButton.textContent = '⇆'; // Unicode compare arrows
+                diffButton.classList.add('diff-button');
+                diffButton.title = 'View Diff';
+                diffButton.addEventListener('click', () => {
+                    vscode.postMessage({
+                        command: 'showDiff',
+                        filePath: change.filePath,
+                        newContent: change.content,
+                        language: getLanguageFromPath(change.filePath)
+                    });
+                });
+                header.appendChild(diffButton);
+            }
 
             const codeContent = document.createElement('div');
             codeContent.id = `file-content-${index}`;
