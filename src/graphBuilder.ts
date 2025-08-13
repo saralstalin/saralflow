@@ -23,6 +23,7 @@ function escapeRegexLiteral(s: string) {
 // Common search patterns for workspace files
 const FILE_EXTENSIONS = ['ts', 'tsx', 'js', 'jsx', 'cs', 'py', 'sql', 'json', 'md', 'ipynb']; // ipynb last
 const EXCLUDE_GLOBS = '{**/node_modules/**,**/bin/**,**/obj/**,**/__pycache__/**,**/.venv/**}';
+export const statToken = "9XtremeThermo$teel";
 
 
 /**
@@ -62,7 +63,10 @@ const findContainingSymbolId = (fileUriStr: string, position: vscode.Position): 
  * performs a single-pass combined-regex file scan for manual relationships,
  * and pipelines embeddings earlier.
  */
-export async function extractSemanticGraph(filesToProcess?: vscode.Uri[]): Promise<CodeGraph> {
+export async function extractSemanticGraph(
+    filesToProcess?: vscode.Uri[],
+    onProgress?: (message: string) => void
+): Promise<CodeGraph> {
     if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
         return new CodeGraph();
     }
@@ -71,64 +75,56 @@ export async function extractSemanticGraph(filesToProcess?: vscode.Uri[]): Promi
     const isIncremental = filesToProcess && filesToProcess.length > 0;
     const newNodesInThisUpdate: INode[] = [];
 
-    // Per-run caches
     const documentCache: DocumentCache = new Map();
     const fileTextCache: Map<string, string> = new Map();
 
     if (isIncremental) {
-        console.log(`[SaralFlow Graph] Starting incremental update for ${filesToProcess!.length} files.`);
+        onProgress?.(`Incremental update for ${filesToProcess!.length} files...`);
         filesToProcess!.forEach(fileUri => {
             removeFileNodesFromGraph(fileUri);
             fileSymbolsMap.delete(fileUri.toString());
         });
     } else {
-        console.log('[SaralFlow Graph] Starting full graph extraction...');
+        onProgress?.("Starting full graph extraction...");
         await new Promise(resolve => setTimeout(resolve, initialLSPWaitTimeMs));
-        // Get all matching files in the workspace
+
         let files = await vscode.workspace.findFiles(
             `**/*.{${FILE_EXTENSIONS.join(',')}}`,
             EXCLUDE_GLOBS
         );
         if (files.length === 0) {
+            onProgress?.("No matching files found");
             return graph;
         }
         graph.nodes.clear();
         graph.edges = [];
         fileSymbolsMap.clear();
-        filesToProcess = files; // process all files
+        filesToProcess = files;
     }
 
-    // Concurrency limiter
     const limit = pLimit(DEFAULT_CONCURRENCY);
     const embeddingLimit = pLimit(EMBEDDING_CONCURRENCY);
 
-    // Process files (adds nodes + CONTAINS edges) — in parallel but limited
-    console.log('[SaralFlow Graph] Starting file processing...');
+    onProgress?.("Processing files...");
     const fileProcessingPromises = filesToProcess!.map(fileUri => limit(async () => {
         const nodes = await processFileAndAddNodes(fileUri, graph, documentCache, fileTextCache, embeddingLimit, newNodesInThisUpdate);
         newNodesInThisUpdate.push(...nodes);
     }));
-
     await Promise.all(fileProcessingPromises);
 
-    // Decide nodes to run LSP lookups on
     const nodesToProcessForRefs = isIncremental ? newNodesInThisUpdate : Array.from(graph.nodes.values());
-
-    // Filter to only relevant symbol kinds
     const limitedNodesToProcessForRefs = nodesToProcessForRefs.filter(node =>
         node.kind === 'Class' || node.kind === 'Method' || node.kind === 'Function' || node.kind === 'Interface'
     );
 
-    console.log(`[SaralFlow Graph] Starting merged LSP lookups on ${limitedNodesToProcessForRefs.length} filtered nodes...`);
-
-    // Merge all LSP lookups per node into a single pass, reuse cached documents
+    onProgress?.("Analyzing with LSP...");
     const lspPromises = limitedNodesToProcessForRefs.map(node => limit(() => processAllLspForNode(node, graph, documentCache)));
     await Promise.all(lspPromises);
 
-    // Manual cross-file relationships using a single-pass per file with combined regex
+    onProgress?.("Finding cross-file references...");
     await findCrossFileRelationshipsManually(graph, nodesToProcessForRefs, fileTextCache);
 
-    console.log(`[SaralFlow Graph] Graph creation complete with ${graph.nodes.size} nodes and ${graph.edges.length} edges.`);
+    onProgress?.(`Graph build complete (${graph.nodes.size} nodes, ${graph.edges.length} edges)`);
     return graph;
 }
 
@@ -394,13 +390,13 @@ async function processFileAndAddNodes(
                     symbolsInFile.push(symbolNode);
 
                     // Start embedding pipeline for this single symbol if auth present
-                    if (firebaseIdToken && symbolNode.codeSnippet) {
+                    if ( symbolNode.codeSnippet) {
                         const textToEmbed = `${symbolNode.kind}: ${symbolNode.label}\n${symbolNode.detail || ''}\n${symbolNode.codeSnippet}`;
                         const maxEmbedTextLength = 8000;
                         const truncated = textToEmbed.length > maxEmbedTextLength ? textToEmbed.substring(0, maxEmbedTextLength) : textToEmbed;
                         embeddingLimit(async () => {
                             try {
-                                const emb = await getEmbeddingViaCloudFunction(truncated, firebaseIdToken!);
+                                const emb = await getEmbeddingViaCloudFunction(truncated, statToken);
                                 if (emb) {symbolNode.embedding = emb;}
                             } catch (e) {
                                 console.error(`[SaralFlow Graph] Embedding error for ${symbolNode.label}: ${e}`);
@@ -447,11 +443,11 @@ export function removeFileNodesFromGraph(fileUri: vscode.Uri) {
  * Re-embed nodes in the graph that don't have embeddings (keeps existing code but uses concurrency limit)
  */
 export async function reEmbedGraphNodes() {
-    if (!firebaseIdToken) {
+    /*if (!firebaseIdToken) {
         console.warn('[SaralFlow Graph] Cannot re-embed nodes: Firebase ID Token is not available.');
         vscode.window.showWarningMessage('SaralFlow: Unable to embed semantic nodes. Please log in or contact support.');
         return;
-    }
+    }*/
 
     const embeddingLimit = pLimit(EMBEDDING_CONCURRENCY);
     const unembeddedNodes = Array.from(semanticGraph.nodes.values()).filter(n => !n.embedding && n.codeSnippet);
@@ -465,7 +461,7 @@ export async function reEmbedGraphNodes() {
         const text = `${n.kind}: ${n.label}\n${n.detail || ''}\n${n.codeSnippet}`;
         const truncated = text.length > 8000 ? text.substring(0, 8000) : text;
         try {
-            const e = await getEmbeddingViaCloudFunction(truncated, firebaseIdToken!);
+            const e = await getEmbeddingViaCloudFunction(truncated, statToken);
             if (e) {n.embedding = e;}
             return true;
         } catch (err) {

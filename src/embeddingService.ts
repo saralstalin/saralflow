@@ -57,7 +57,7 @@ export async function getEmbeddingViaCloudFunction(text: string, firebaseIdToken
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${firebaseIdToken}` // Include the Firebase ID token
+                'x-api-key': `${firebaseIdToken}` // Include the Firebase ID token
             },
             body: JSON.stringify({ text: text }) // Send the text to be embedded
         });
