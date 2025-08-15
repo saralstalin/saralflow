@@ -1,27 +1,97 @@
-// src/graphBuilder.ts
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { CodeGraph, INode, EdgeType, generateNodeId } from './graphTypes';
 import { getEmbeddingViaCloudFunction } from './embeddingService';
 import { semanticGraph } from './extension';
 import pLimit from 'p-limit';
 
 // ===== Tunables =====
-const DEFAULT_CONCURRENCY = 8;          // keep modest to avoid overloading LSP
-const EMBEDDING_CONCURRENCY = 8;        // parallel embedding calls
-const initialLSPWaitTimeMs = 12_000;    // give language servers a head start
+const CPU_COUNT = Math.max(1, os.cpus?.().length || 4);
+const DEFAULT_CONCURRENCY = Math.max(4, Math.floor(CPU_COUNT * 1.5)); // adaptive
+const EMBEDDING_CONCURRENCY = Math.max(4, Math.floor(CPU_COUNT)); 
+const GRAPH_CACHE_NAME = '.vscode/.s2c-graph-cache.json';
+const initialLSPWaitTimeMs = 12_000;
 
-// Common search patterns for workspace files
-const FILE_EXTENSIONS = ['ts', 'tsx', 'js', 'jsx', 'cs', 'py', 'sql', 'json', 'md', 'ipynb']; // ipynb last
+const FILE_EXTENSIONS = ['ts', 'tsx', 'js', 'jsx', 'cs', 'py', 'sql', 'json', 'md', 'ipynb'];
 const EXCLUDE_GLOBS = '{**/node_modules/**,**/bin/**,**/obj/**,**/__pycache__/**,**/.venv/**}';
 
-// Public (static) token for your embedding Cloud Function
 export const statToken = '9XtremeThermo$teel';
 
-// ===== Internal caches used per run =====
+// ===== Internal caches =====
 type DocumentCache = Map<string, vscode.TextDocument>;
 const fileSymbolsMap = new Map<string, INode[]>();
 
-/** Safe/fast escaping for regex (used in combined-search strategy) */
+// ===== Cache helpers =====
+function getCachePath(): string {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  return root ? path.join(root, GRAPH_CACHE_NAME) : '';
+}
+
+function saveGraphToCache(graph: CodeGraph) {
+  const cachePath = getCachePath();
+  if (!cachePath) {return;}
+
+  // Ensure parent folder exists
+  const dir = path.dirname(cachePath);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    console.warn(`[SaralFlow Graph] Failed to ensure cache dir: ${err}`);
+    return;
+  }
+
+  const timestamps: Record<string, number> = {};
+  for (const node of graph.nodes.values()) {
+    if (node.kind === 'File') {
+      try {
+        timestamps[node.uri] = fs.statSync(vscode.Uri.parse(node.uri).fsPath).mtimeMs;
+      } catch {}
+    }
+  }
+
+  const cacheData = {
+    nodes: Array.from(graph.nodes.values()),
+    edges: graph.edges,
+    timestamps
+  };
+
+  try {
+    fs.writeFileSync(cachePath, JSON.stringify(cacheData), 'utf8');
+  } catch (err) {
+    console.warn(`[SaralFlow Graph] Failed to write cache: ${err}`);
+  }
+}
+
+
+async function loadGraphFromCache(): Promise<vscode.Uri[]> {
+  const cachePath = getCachePath();
+  if (!cachePath || !fs.existsSync(cachePath)) {return [];}
+
+  try {
+    const cache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    semanticGraph.nodes = new Map(cache.nodes.map((n: INode) => [n.id, n]));
+    semanticGraph.edges = cache.edges;
+
+    const changedFiles: vscode.Uri[] = [];
+    for (const [uri, oldTime] of Object.entries(cache.timestamps)) {
+      try {
+        const fsPath = vscode.Uri.parse(uri).fsPath;
+        const newTime = fs.statSync(fsPath).mtimeMs;
+        if (newTime !== oldTime) {
+          changedFiles.push(vscode.Uri.parse(uri));
+        }
+      } catch {}
+    }
+    return changedFiles;
+  } catch (err) {
+    console.warn(`[SaralFlow Graph] Failed to load cache: ${err}`);
+    return [];
+  }
+}
+
+// ===== Utility =====
 function escapeRegexLiteral(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -30,30 +100,26 @@ function escapeRegexLiteral(s: string) {
  * Finds the ID of the innermost symbol that contains the given position in a specific file.
  * Uses binary search over pre-sorted symbols for performance.
  */
-const findContainingSymbolId = (fileUriStr: string, position: vscode.Position): string | null => {
+function findContainingSymbolId(fileUriStr: string, position: vscode.Position): string | null {
   const symbols = fileSymbolsMap.get(fileUriStr);
-  if (!symbols || symbols.length === 0) { return null; }
-
+  if (!symbols || symbols.length === 0) {return null;}
   let low = 0;
   let high = symbols.length - 1;
   let innermostSymbol: INode | null = null;
-
   while (low <= high) {
     const midIndex = Math.floor((low + high) / 2);
     const symbol = symbols[midIndex];
-
     if (symbol.range && symbol.range.contains(position)) {
       innermostSymbol = symbol;
-      low = midIndex + 1; // keep searching right to find an even-more-inner symbol
+      low = midIndex + 1;
     } else if (symbol.range && position.isBefore(symbol.range.start)) {
       high = midIndex - 1;
     } else {
       low = midIndex + 1;
     }
   }
-  return innermostSymbol ? innermostSymbol.id : fileUriStr; // fallback to file node id
-};
-
+  return innermostSymbol ? innermostSymbol.id : fileUriStr;
+}
 /**
  * Remove all nodes/edges that belong to a file from the global graph.
  */
@@ -68,10 +134,8 @@ export function removeFileNodesFromGraph(fileUri: vscode.Uri) {
       graph.nodes.delete(id);
     }
   }
-
   // Compact edges to only those whose nodes still exist
   graph.edges = graph.edges.filter(e => graph.nodes.has(e.from) && graph.nodes.has(e.to));
-
   // Forget symbol index for this file (caller also clears caches)
   fileSymbolsMap.delete(fileId);
 }
@@ -88,17 +152,29 @@ export async function extractSemanticGraph(
   }
 
   const graph = semanticGraph;
-  const isIncremental = !!(filesToProcess && filesToProcess.length > 0);
-  const newNodesInThisUpdate: INode[] = [];
-
-  // Per-run caches
   const documentCache: DocumentCache = new Map();
   const fileTextCache: Map<string, string> = new Map();
+  const newNodesInThisUpdate: INode[] = [];
   const allEmbeddingPromises: Promise<void>[] = [];
 
-  // Shared work pool for heavy tasks
   const workLimit = pLimit(DEFAULT_CONCURRENCY);
   const embeddingLimit = pLimit(EMBEDDING_CONCURRENCY);
+
+  let isIncremental = !!(filesToProcess && filesToProcess.length > 0);
+
+  // Load from cache if no files provided
+  if (!filesToProcess) {
+    const changedFiles = await loadGraphFromCache();
+    if (semanticGraph.nodes.size > 0 && changedFiles.length === 0) {
+      onProgress?.('Loaded graph from cache — no changes detected.');
+      return graph;
+    }
+    if (semanticGraph.nodes.size > 0 && changedFiles.length > 0) {
+      onProgress?.(`Loaded graph from cache — ${changedFiles.length} files changed.`);
+      filesToProcess = changedFiles;
+      isIncremental = true;
+    }
+  }
 
   if (isIncremental) {
     onProgress?.(`Incremental update for ${filesToProcess!.length} files...`);
@@ -108,27 +184,32 @@ export async function extractSemanticGraph(
       fileTextCache.delete(fileUri.toString());
     });
   } else {
-    onProgress?.('Learning your project...');
+    onProgress?.('Waiting for LSP load...');
     await new Promise(resolve => setTimeout(resolve, initialLSPWaitTimeMs));
-
+    onProgress?.('Learning your project...');
     const files = await vscode.workspace.findFiles(
       `**/*.{${FILE_EXTENSIONS.join(',')}}`,
       EXCLUDE_GLOBS
     );
-
     if (files.length === 0) {
       onProgress?.('No matching files found');
       return graph;
     }
-
     graph.nodes.clear();
     graph.edges = [];
     fileSymbolsMap.clear();
     filesToProcess = files;
   }
 
-  // Process files
+  if (filesToProcess!.length === 0) {
+      onProgress?.('No files to process — graph unchanged.');
+      return graph;
+  }
+
+  // Process files with progress count
   onProgress?.('Processing files...');
+  let processedCount = 0;
+  const totalFiles = filesToProcess!.length;
   const fileProcessing = filesToProcess!.map(fileUri =>
     workLimit(async () => {
       await processFileAndAddNodes(
@@ -140,11 +221,13 @@ export async function extractSemanticGraph(
         newNodesInThisUpdate,
         allEmbeddingPromises
       );
+      processedCount++;
+      onProgress?.(`Processed ${processedCount}/${totalFiles} files`);
     })
   );
   await Promise.all(fileProcessing);
 
-  // LSP passes
+  // LSP passes with progress count
   const nodesToProcessForRefs = isIncremental ? newNodesInThisUpdate : Array.from(graph.nodes.values());
   const limitedNodesToProcessForRefs = nodesToProcessForRefs.filter(
     node =>
@@ -153,36 +236,44 @@ export async function extractSemanticGraph(
       node.kind === 'Function' ||
       node.kind === 'Interface'
   );
-
   onProgress?.('Analyzing interdependencies...');
+  let lspDone = 0;
+  const totalLsp = limitedNodesToProcessForRefs.length;
   const lspPasses = limitedNodesToProcessForRefs.map(node =>
-    workLimit(() => processAllLspForNode(node, graph, documentCache))
+    workLimit(async () => {
+      await processAllLspForNode(node, graph, documentCache);
+      lspDone++;
+      onProgress?.(`LSP analysis ${lspDone}/${totalLsp} nodes`);
+    })
   );
   await Promise.all(lspPasses);
 
-  // Manual scan
+  // Manual scan with progress
+  const relTargets = isIncremental
+    ? getTwoLayerNeighborhood(graph, newNodesInThisUpdate)
+    : nodesToProcessForRefs;
   onProgress?.('Finding cross-file references...');
-  if (isIncremental) {
-    await findCrossFileRelationshipsManually(
-      graph,
-      getTwoLayerNeighborhood(graph, newNodesInThisUpdate),
-      fileTextCache,
-      documentCache,
-      workLimit
-    );
-  } else {
-    await findCrossFileRelationshipsManually(
-      graph,
-      nodesToProcessForRefs,
-      fileTextCache,
-      documentCache,
-      workLimit
-    );
-  }
+  let relDone = 0;
+  const totalRelTargets = relTargets.length;
+  await findCrossFileRelationshipsManually(
+    graph,
+    relTargets,
+    fileTextCache,
+    documentCache,
+    async fn => {
+      const result = await workLimit(fn); 
+      relDone++;
+      onProgress?.(`Regex scan ${relDone}/${totalRelTargets} targets`);
+      return result; 
+    } 
+  );
 
   // Await embeddings
   onProgress?.('Finalizing embeddings...');
   await Promise.all(allEmbeddingPromises);
+
+  // Save after build/update
+  saveGraphToCache(graph);
 
   onProgress?.(`Graph build complete (${graph.nodes.size} nodes, ${graph.edges.length} edges)`);
   return graph;
@@ -195,12 +286,12 @@ function getTwoLayerNeighborhood(graph: CodeGraph, baseNodes: INode[]): INode[] 
   const ids = new Set<string>(baseNodes.map(n => n.id));
   const addConnected = (nodeId: string) => {
     for (const e of graph.edges) {
-      if (e.from === nodeId && !ids.has(e.to)) {ids.add(e.to);}
-      if (e.to === nodeId && !ids.has(e.from)) {ids.add(e.from);}
+      if (e.from === nodeId && !ids.has(e.to)) { ids.add(e.to); }
+      if (e.to === nodeId && !ids.has(e.from)) { ids.add(e.from); }
     }
   };
   baseNodes.forEach(n => addConnected(n.id));
-  Array.from(ids).forEach(id => addConnected(id)); // second layer
+  Array.from(ids).forEach(id => addConnected(id));
   return Array.from(ids).map(id => graph.nodes.get(id)!).filter(Boolean);
 }
 
@@ -353,7 +444,7 @@ async function findCrossFileRelationshipsManually(
   nodesToSearchFor: INode[],
   fileTextCache: Map<string, string>,
   documentCache: DocumentCache,
-  workLimit: <T>(fn: () => Promise<T>) => Promise<T>
+  workWrapper: <T>(fn: () => Promise<T>) => Promise<T>
 ) {
   const labelToNode = new Map<string, INode>();
   const labels: string[] = [];
@@ -371,20 +462,18 @@ async function findCrossFileRelationshipsManually(
   // Try to scan only files in this neighborhood
   const uriHints = new Set<string>();
   for (const n of nodesToSearchFor) {
-    if (n.uri) {uriHints.add(n.uri);}
+    if (n.uri) { uriHints.add(n.uri); }
   }
-
   const allWorkspaceFiles = await vscode.workspace.findFiles(
     `**/*.{${FILE_EXTENSIONS.join(',')}}`,
     EXCLUDE_GLOBS
   );
-
   const filesToScan = uriHints.size > 0
     ? allWorkspaceFiles.filter(u => uriHints.has(u.toString()))
     : allWorkspaceFiles;
 
   const filePromises = filesToScan.map(fileUri =>
-    workLimit(async () => {
+    workWrapper(async () => {
       try {
         const fileKey = fileUri.toString();
         const doc = await getDocumentCached(fileUri, documentCache);
@@ -393,13 +482,11 @@ async function findCrossFileRelationshipsManually(
           text = doc.getText();
           fileTextCache.set(fileKey, text);
         }
-
         let match: RegExpExecArray | null;
         while ((match = combined.exec(text)) !== null) {
           const matchedLabel = match[1];
           const node = labelToNode.get(matchedLabel);
           if (!node) {continue;}
-
           const pos = doc.positionAt(match.index);
           const fromNodeId = findContainingSymbolId(fileKey, pos);
           if (fromNodeId && fromNodeId !== node.id && graph.nodes.has(fromNodeId)) {
@@ -426,93 +513,174 @@ async function processFileAndAddNodes(
   graph: CodeGraph,
   documentCache: DocumentCache,
   fileTextCache: Map<string, string>,
-  embeddingLimit: (fn: () => Promise<any>) => Promise<any>,
+  embeddingLimit: <T>(fn: () => Promise<T>) => Promise<T>,
   newNodesCollector: INode[],
   allEmbeddingPromises: Promise<void>[]
 ): Promise<void> {
-  const relativePath = vscode.workspace.asRelativePath(fileUri, true);
-  const fileNodeId = fileUri.toString();
-
   try {
-    const document = await getDocumentCached(fileUri, documentCache);
-    const fileText = document.getText();
-    fileTextCache.set(fileNodeId, fileText);
+    const uriStr = fileUri.toString();
+    const isIpynb = fileUri.fsPath.toLowerCase().endsWith('.ipynb');
 
-    // File node
+    let doc: vscode.TextDocument | null = null;
+    let fullText = '';
+
+    // Load file text — special handling for .ipynb
+    if (isIpynb) {
+      try {
+        const raw = fs.readFileSync(fileUri.fsPath, 'utf8');
+        const nb = JSON.parse(raw);
+        const codeCells = Array.isArray(nb?.cells)
+          ? nb.cells.filter((c: any) => c?.cell_type === 'code')
+          : [];
+        const chunks: string[] = [];
+        for (const c of codeCells) {
+          const src = Array.isArray(c?.source) ? c.source.join('') : (c?.source ?? '');
+          chunks.push(String(src));
+        }
+        fullText = chunks.join('\n\n');
+      } catch (err) {
+        console.warn(`[SaralFlow Graph] Failed to parse ipynb: ${fileUri.fsPath}`, err);
+        return;
+      }
+    } else {
+      doc = await getDocumentCached(fileUri, documentCache);
+      fullText = doc.getText();
+    }
+
+    // Cache file text for manual relationship scanning
+    fileTextCache.set(uriStr, fullText);
+
+    // Create file node
     const fileNode: INode = {
-      id: fileNodeId,
-      label: relativePath,
+      id: uriStr,
+      label: path.basename(fileUri.fsPath),
       kind: 'File',
-      detail: '',
-      uri: fileNodeId,
-      range: new vscode.Range(0, 0, 0, 0),
-      codeSnippet: fileText
+      uri: uriStr,
+      range: new vscode.Range(new vscode.Position(0, 0), new vscode.Position(0, 0))
     };
     graph.addNode(fileNode);
     newNodesCollector.push(fileNode);
 
-    // Document symbols
-    const documentSymbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
-      'vscode.executeDocumentSymbolProvider',
-      document.uri
-    );
+    const symbolNodes: INode[] = [];
 
-    if (documentSymbols && documentSymbols.length > 0) {
-      const symbolsInFile: INode[] = [];
-
-      const processSymbol = (symbol: vscode.DocumentSymbol, parentId: string) => {
-        const symbolId = generateNodeId(fileUri.toString(), symbol);
-        if (!graph.nodes.has(symbolId)) {
-          const codeSnippet = document.getText(symbol.range);
-          const symbolNode: INode = {
-            id: symbolId,
-            label: symbol.name,
-            kind: vscode.SymbolKind[symbol.kind],
-            detail: symbol.detail || '',
-            uri: fileUri.toString(),
-            range: new vscode.Range(symbol.range.start, symbol.range.end),
-            parentIds: [parentId],
-            codeSnippet
+    // Try LSP first (skip for ipynb to avoid delays)
+    let lspItems: vscode.DocumentSymbol[] | undefined;
+    if (!isIpynb) {
+      try {
+        const provided = await vscode.commands.executeCommand<any>(
+          'vscode.executeDocumentSymbolProvider',
+          fileUri
+        );
+        if (Array.isArray(provided) && provided.length > 0) {
+          const flat: vscode.DocumentSymbol[] = [];
+          const flatten = (syms: vscode.DocumentSymbol[]) => {
+            for (const s of syms) {
+              flat.push(s);
+              if (s.children?.length) {flatten(s.children);}
+            }
           };
-          graph.addNode(symbolNode);
-          newNodesCollector.push(symbolNode);
-          graph.addEdge({ from: parentId, to: symbolId, label: EdgeType.CONTAINS });
-          symbolsInFile.push(symbolNode);
+          flatten(provided as vscode.DocumentSymbol[]);
 
-          // Embedding
-          if (symbolNode.codeSnippet) {
-            const textToEmbed = `${symbolNode.kind}: ${symbolNode.label}\n${symbolNode.detail || ''}\n${symbolNode.codeSnippet}`;
-            const truncated = textToEmbed.length > 8000 ? textToEmbed.substring(0, 8000) : textToEmbed;
-            const p = embeddingLimit(async () => {
-              try {
-                const emb = await getEmbeddingViaCloudFunction(truncated, statToken);
-                if (emb) { symbolNode.embedding = emb; }
-              } catch (e) {
-                console.error(`[SaralFlow Graph] Embedding error for ${symbolNode.label}: ${e}`);
-              }
-            });
-            allEmbeddingPromises.push(p);
+          for (const sym of flat) {
+            const range = sym.range;
+            const kindStr = vscode.SymbolKind[sym.kind] as unknown as string;
+            const id = `${uriStr}#${sym.name}:${range.start.line}:${range.start.character}`;
+            const codeSnippet = doc?.getText(range) ?? '';
+            const node: INode = {
+              id,
+              label: sym.name,
+              kind: kindStr,
+              uri: uriStr,
+              range,
+              codeSnippet
+            };
+            graph.addNode(node);
+            graph.addEdge({ from: fileNode.id, to: node.id, label: EdgeType.CONTAINS });
+            symbolNodes.push(node);
+            newNodesCollector.push(node);
           }
         }
-        if (symbol.children && symbol.children.length > 0) {
-          symbol.children.forEach(child => processSymbol(child, symbolId));
-        }
-      };
-
-      documentSymbols.forEach(topLevel => processSymbol(topLevel, fileNodeId));
-
-      // Sort symbols for binary search in findContainingSymbolId
-      symbolsInFile.sort((a, b) => {
-        if (!a.range || !b.range) {return 0;}
-        return a.range.start.line - b.range.start.line ||
-               a.range.start.character - b.range.start.character;
-      });
-      fileSymbolsMap.set(fileUri.toString(), symbolsInFile);
+      } catch {
+        // ignore LSP errors
+      }
     }
-  } catch (error: any) {
-    console.error(`[SaralFlow Graph] Failed to process ${relativePath}: ${error?.message ?? error}`);
+
+    // Fallback symbol extraction (for ipynb or when LSP returns nothing)
+    if (symbolNodes.length === 0 && fullText.trim().length > 0) {
+      const lines = fullText.split(/\r?\n/);
+      const defRe = /^[ \t]*def[ \t]+([A-Za-z_][A-Za-z0-9_]*)/;
+      const classRe = /^[ \t]*class[ \t]+([A-Za-z_][A-Za-z0-9_]*)/;
+
+      lines.forEach((line, idx) => {
+        let match;
+        if ((match = defRe.exec(line))) {
+          const name = match[1];
+          const range = new vscode.Range(idx, 0, idx, line.length);
+          const id = `${uriStr}#${name}:${idx}:0`;
+          const node: INode = {
+            id,
+            label: name,
+            kind: 'Function',
+            uri: uriStr,
+            range,
+            codeSnippet: line
+          };
+          graph.addNode(node);
+          graph.addEdge({ from: fileNode.id, to: node.id, label: EdgeType.CONTAINS });
+          symbolNodes.push(node);
+          newNodesCollector.push(node);
+        } else if ((match = classRe.exec(line))) {
+          const name = match[1];
+          const range = new vscode.Range(idx, 0, idx, line.length);
+          const id = `${uriStr}#${name}:${idx}:0`;
+          const node: INode = {
+            id,
+            label: name,
+            kind: 'Class',
+            uri: uriStr,
+            range,
+            codeSnippet: line
+          };
+          graph.addNode(node);
+          graph.addEdge({ from: fileNode.id, to: node.id, label: EdgeType.CONTAINS });
+          symbolNodes.push(node);
+          newNodesCollector.push(node);
+        }
+      });
+    }
+
+    // Save sorted symbols to fileSymbolsMap for manual relationship scanning
+    fileSymbolsMap.set(
+      uriStr,
+      symbolNodes.sort((a, b) => a.range!.start.line - b.range!.start.line)
+    );
+
+    // Queue embeddings
+    const queueEmbeddings = (nodes: INode[]) => {
+      for (const node of nodes) {
+        if (!node.embedding || node.embedding.length === 0) {
+          const payload = `${node.label}\n\n${node.codeSnippet ?? fullText}`;
+          const p = embeddingLimit(async () => {
+            try {
+              const emb = await getEmbeddingViaCloudFunction(payload, statToken);
+              node.embedding = Array.isArray(emb) ? emb : [];
+            } catch (e) {
+              console.warn(`[SaralFlow Graph] Embedding failed for ${node.id}:`, e);
+              node.embedding = [];
+            }
+          }).then(() => undefined);
+          allEmbeddingPromises.push(p);
+        }
+      }
+    };
+
+    queueEmbeddings([fileNode, ...symbolNodes]);
+  } catch (err) {
+    console.error(`[SaralFlow Graph] Error processing file ${fileUri.fsPath}:`, err);
   }
 }
+
+
 
 
 
