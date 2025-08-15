@@ -32,7 +32,7 @@ function escapeRegexLiteral(s: string) {
  */
 const findContainingSymbolId = (fileUriStr: string, position: vscode.Position): string | null => {
   const symbols = fileSymbolsMap.get(fileUriStr);
-  if (!symbols || symbols.length === 0) {return null;}
+  if (!symbols || symbols.length === 0) { return null; }
 
   let low = 0;
   let high = symbols.length - 1;
@@ -44,23 +44,40 @@ const findContainingSymbolId = (fileUriStr: string, position: vscode.Position): 
 
     if (symbol.range && symbol.range.contains(position)) {
       innermostSymbol = symbol;
-      // Look right to find a more nested symbol that still contains the position
-      low = midIndex + 1;
+      low = midIndex + 1; // keep searching right to find an even-more-inner symbol
     } else if (symbol.range && position.isBefore(symbol.range.start)) {
       high = midIndex - 1;
     } else {
       low = midIndex + 1;
     }
   }
-  return innermostSymbol ? innermostSymbol.id : fileUriStr;
+  return innermostSymbol ? innermostSymbol.id : fileUriStr; // fallback to file node id
 };
 
 /**
+ * Remove all nodes/edges that belong to a file from the global graph.
+ */
+export function removeFileNodesFromGraph(fileUri: vscode.Uri) {
+  const graph = semanticGraph;
+  const fileId = fileUri.toString();
+  const idPrefix = `${fileId}#`;
+
+  // Remove nodes belonging to this file
+  for (const id of Array.from(graph.nodes.keys())) {
+    if (id === fileId || id.startsWith(idPrefix)) {
+      graph.nodes.delete(id);
+    }
+  }
+
+  // Compact edges to only those whose nodes still exist
+  graph.edges = graph.edges.filter(e => graph.nodes.has(e.from) && graph.nodes.has(e.to));
+
+  // Forget symbol index for this file (caller also clears caches)
+  fileSymbolsMap.delete(fileId);
+}
+
+/**
  * Top-level function to extract or incrementally update the semantic graph.
- * - Caches documents
- * - Merges LSP calls per node
- * - Single-pass combined-regex file scan for manual relationships
- * - Pipelines embeddings early for great UX
  */
 export async function extractSemanticGraph(
   filesToProcess?: vscode.Uri[],
@@ -77,14 +94,18 @@ export async function extractSemanticGraph(
   // Per-run caches
   const documentCache: DocumentCache = new Map();
   const fileTextCache: Map<string, string> = new Map();
-  const allEmbeddingPromises: Promise<void>[] = []; // <-- NEW
+  const allEmbeddingPromises: Promise<void>[] = [];
+
+  // Shared work pool for heavy tasks
+  const workLimit = pLimit(DEFAULT_CONCURRENCY);
+  const embeddingLimit = pLimit(EMBEDDING_CONCURRENCY);
 
   if (isIncremental) {
     onProgress?.(`Incremental update for ${filesToProcess!.length} files...`);
     filesToProcess!.forEach(fileUri => {
       removeFileNodesFromGraph(fileUri);
       fileSymbolsMap.delete(fileUri.toString());
-      fileTextCache.delete(fileUri.toString()); // <-- Clear stale file text
+      fileTextCache.delete(fileUri.toString());
     });
   } else {
     onProgress?.('Learning your project...');
@@ -106,12 +127,10 @@ export async function extractSemanticGraph(
     filesToProcess = files;
   }
 
-  const limit = pLimit(DEFAULT_CONCURRENCY);
-  const embeddingLimit = pLimit(EMBEDDING_CONCURRENCY);
-
+  // Process files
   onProgress?.('Processing files...');
   const fileProcessing = filesToProcess!.map(fileUri =>
-    limit(async () => {
+    workLimit(async () => {
       await processFileAndAddNodes(
         fileUri,
         graph,
@@ -119,12 +138,13 @@ export async function extractSemanticGraph(
         fileTextCache,
         embeddingLimit,
         newNodesInThisUpdate,
-        allEmbeddingPromises // <-- pass down for embedding collection
+        allEmbeddingPromises
       );
     })
   );
   await Promise.all(fileProcessing);
 
+  // LSP passes
   const nodesToProcessForRefs = isIncremental ? newNodesInThisUpdate : Array.from(graph.nodes.values());
   const limitedNodesToProcessForRefs = nodesToProcessForRefs.filter(
     node =>
@@ -136,28 +156,35 @@ export async function extractSemanticGraph(
 
   onProgress?.('Analyzing interdependencies...');
   const lspPasses = limitedNodesToProcessForRefs.map(node =>
-    limit(() => processAllLspForNode(node, graph, documentCache))
+    workLimit(() => processAllLspForNode(node, graph, documentCache))
   );
   await Promise.all(lspPasses);
 
+  // Manual scan
   onProgress?.('Finding cross-file references...');
   if (isIncremental) {
-    // Restrict manual scan to changed files + connected files
     await findCrossFileRelationshipsManually(
       graph,
       getTwoLayerNeighborhood(graph, newNodesInThisUpdate),
-      fileTextCache
+      fileTextCache,
+      documentCache,
+      workLimit
     );
   } else {
-    await findCrossFileRelationshipsManually(graph, nodesToProcessForRefs, fileTextCache);
+    await findCrossFileRelationshipsManually(
+      graph,
+      nodesToProcessForRefs,
+      fileTextCache,
+      documentCache,
+      workLimit
+    );
   }
 
-  // Wait for all embeddings to finish
+  // Await embeddings
   onProgress?.('Finalizing embeddings...');
   await Promise.all(allEmbeddingPromises);
 
   onProgress?.(`Graph build complete (${graph.nodes.size} nodes, ${graph.edges.length} edges)`);
-
   return graph;
 }
 
@@ -192,8 +219,7 @@ async function getDocumentCached(
 }
 
 /**
- * Merged LSP processing for a single node: references, inheritance, call hierarchy.
- * Reuses the cached document and gracefully falls back to text-based searches if LSP fails.
+ * Parallelized LSP processing for a node.
  */
 async function processAllLspForNode(
   node: INode,
@@ -204,127 +230,130 @@ async function processAllLspForNode(
 
   try {
     const document = await getDocumentCached(node.uri, documentCache);
+    const tasks: Promise<void>[] = [];
 
-    // Type hierarchy / inheritance
+    // Type hierarchy
     if (node.kind === 'Class' || node.kind === 'Interface') {
-      try {
-        const typeItems = await vscode.commands.executeCommand<vscode.TypeHierarchyItem[]>(
-          'vscode.prepareTypeHierarchy',
-          document.uri,
-          node.range.start
-        );
-        if (typeItems && typeItems.length > 0) {
-          const supertypes = await vscode.commands.executeCommand<vscode.TypeHierarchyItem[]>(
-            'vscode.executeTypeHierarchySupertypes',
-            typeItems[0]
+      tasks.push((async () => {
+        try {
+          const typeItems = await vscode.commands.executeCommand<vscode.TypeHierarchyItem[]>(
+            'vscode.prepareTypeHierarchy',
+            document.uri,
+            node.range!.start
           );
-          if (supertypes && supertypes.length > 0) {
-            supertypes.forEach(s => {
+          if (typeItems && typeItems.length > 0) {
+            const supertypes = await vscode.commands.executeCommand<vscode.TypeHierarchyItem[]>(
+              'vscode.executeTypeHierarchySupertypes',
+              typeItems[0]
+            ); 
+            supertypes?.forEach(s => {
               const superId = generateNodeId(s.uri.toString(), s);
               if (graph.nodes.has(superId)) {
                 graph.addEdge({ from: node.id, to: superId, label: EdgeType.INHERITS_FROM });
               }
             });
           }
+        } catch (err) {
+          console.warn(`[SaralFlow Graph] LSP inheritance failed for ${node.label}: ${err}`);
         }
-      } catch (err) {
-        console.warn(`[SaralFlow Graph] LSP inheritance failed for ${node.label}: ${err}`);
-      }
+      })());
     }
 
     // References
-    try {
-      const refs = await vscode.commands.executeCommand<vscode.Location[]>(
-        'vscode.executeReferenceProvider',
-        document.uri,
-        node.range.start
-      );
-      if (refs && refs.length > 0) {
-        refs.forEach(ref => {
+    tasks.push((async () => {
+      try {
+        const refs = await vscode.commands.executeCommand<vscode.Location[]>(
+          'vscode.executeReferenceProvider',
+          document.uri,
+          node.range!.start
+        );
+        refs?.forEach(ref => {
           const refFileUriStr = ref.uri.toString();
-          if (refFileUriStr === node.uri && ref.range.isEqual(node.range!)) {return;}
-
+          if (refFileUriStr === node.uri && ref.range.isEqual(node.range!)) {return;} // self
           const fromNodeId = findContainingSymbolId(refFileUriStr, ref.range.start);
           if (fromNodeId && graph.nodes.has(fromNodeId) && fromNodeId !== node.id) {
             graph.addEdge({ from: fromNodeId, to: node.id, label: EdgeType.REFERENCES });
           }
         });
+      } catch (err) {
+        console.warn(`[SaralFlow Graph] LSP references failed for ${node.label}: ${err}`);
       }
-    } catch (err) {
-      console.warn(`[SaralFlow Graph] LSP references failed for ${node.label}: ${err}`);
-    }
+    })());
 
-    // Call Hierarchy (outgoing/incoming) for functions/methods
+    // Call hierarchy
     if (node.kind === 'Function' || node.kind === 'Method') {
-      try {
-        const callItems = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>(
-          'vscode.prepareCallHierarchy',
-          document.uri,
-          node.range.start
-        );
-        if (callItems && callItems.length > 0) {
-          const outgoing = await vscode.commands.executeCommand<vscode.CallHierarchyOutgoingCall[]>(
-            'vscode.executeCallHierarchyOutgoingCalls',
-            callItems[0]
+      tasks.push((async () => {
+        try {
+          const callItems = await vscode.commands.executeCommand<vscode.CallHierarchyItem[]>(
+            'vscode.prepareCallHierarchy',
+            document.uri,
+            node.range!.start
           );
-          if (outgoing && outgoing.length > 0) {
-            outgoing.forEach(call => {
+          if (callItems && callItems.length > 0) {
+            const [outgoing, incoming] = await Promise.all([
+              vscode.commands.executeCommand<vscode.CallHierarchyOutgoingCall[]>(
+                'vscode.executeCallHierarchyOutgoingCalls',
+                callItems[0]
+              ),
+              vscode.commands.executeCommand<vscode.CallHierarchyIncomingCall[]>(
+                'vscode.executeCallHierarchyIncomingCalls',
+                callItems[0]
+              )
+            ]);
+            outgoing?.forEach(call => {
               const toId = generateNodeId(call.to.uri.toString(), call.to);
               if (graph.nodes.has(toId)) {
                 graph.addEdge({ from: node.id, to: toId, label: EdgeType.CALLS });
               }
             });
-          }
-
-          const incoming = await vscode.commands.executeCommand<vscode.CallHierarchyIncomingCall[]>(
-            'vscode.executeCallHierarchyIncomingCalls',
-            callItems[0]
-          );
-          if (incoming && incoming.length > 0) {
-            incoming.forEach(call => {
+            incoming?.forEach(call => {
               const fromId = generateNodeId(call.from.uri.toString(), call.from);
               if (graph.nodes.has(fromId)) {
                 graph.addEdge({ from: fromId, to: node.id, label: EdgeType.CALLS });
               }
             });
           }
-        }
-      } catch (err) {
-        console.warn(`[SaralFlow Graph] LSP call hierarchy failed for ${node.label}: ${err}`);
-
-        // Fallback: light text scan in already-processed files
-        try {
-          for (const fileUriStr of fileSymbolsMap.keys()) {
-            const doc = await getDocumentCached(fileUriStr, documentCache);
-            const text = doc.getText();
-            const regex = new RegExp(`\\b${escapeRegexLiteral(node.label)}\\b`, 'g');
-            let match: RegExpExecArray | null;
-            while ((match = regex.exec(text)) !== null) {
-              const pos = doc.positionAt(match.index);
-              const callerId = findContainingSymbolId(fileUriStr, pos);
-              if (callerId && callerId !== node.id) {
-                graph.addEdge({ from: callerId, to: node.id, label: EdgeType.CALLS });
+        } catch (err) {
+          console.warn(`[SaralFlow Graph] LSP call hierarchy failed for ${node.label}: ${err}`);
+          // Fallback: text search to recover some callers
+          try {
+            for (const fileUriStr of fileSymbolsMap.keys()) {
+              const doc = await getDocumentCached(fileUriStr, documentCache);
+              const text = doc.getText();
+              const regex = new RegExp(`\\b${escapeRegexLiteral(node.label)}\\b`, 'g');
+              let match: RegExpExecArray | null;
+              while ((match = regex.exec(text)) !== null) {
+                const pos = doc.positionAt(match.index);
+                const callerId = findContainingSymbolId(fileUriStr, pos);
+                if (callerId && callerId !== node.id) {
+                  graph.addEdge({ from: callerId, to: node.id, label: EdgeType.CALLS });
+                }
               }
             }
+          } catch (fallbackErr) {
+            console.warn(`[SaralFlow Graph] Fallback call search failed for ${node.label}: ${fallbackErr}`);
           }
-        } catch (fallbackErr) {
-          console.warn(`[SaralFlow Graph] Fallback call search failed for ${node.label}: ${fallbackErr}`);
         }
-      }
+      })());
     }
+
+    await Promise.all(tasks);
   } catch (outerErr) {
     console.warn(`[SaralFlow Graph] Processing LSP for ${node.label} failed: ${outerErr}`);
   }
 }
 
 /**
- * Manually search workspace files for references/calls using a combined regex per file.
- * This reduces O(files * labels) to approximately O(files + totalMatches).
+ * Manual cross-file relationship finder.
+ * - Opens each file once (reuses doc for text & position)
+ * - In incremental runs, narrows to neighborhood file URIs when possible
  */
 async function findCrossFileRelationshipsManually(
   graph: CodeGraph,
   nodesToSearchFor: INode[],
-  fileTextCache: Map<string, string>
+  fileTextCache: Map<string, string>,
+  documentCache: DocumentCache,
+  workLimit: <T>(fn: () => Promise<T>) => Promise<T>
 ) {
   const labelToNode = new Map<string, INode>();
   const labels: string[] = [];
@@ -337,24 +366,30 @@ async function findCrossFileRelationshipsManually(
   }
   if (labels.length === 0) {return;}
 
-  // Combined regex capturing label in group 1
   const combined = new RegExp(`\\b(${labels.join('|')})\\b`, 'g');
 
-  // Get all workspace files once
+  // Try to scan only files in this neighborhood
+  const uriHints = new Set<string>();
+  for (const n of nodesToSearchFor) {
+    if (n.uri) {uriHints.add(n.uri);}
+  }
+
   const allWorkspaceFiles = await vscode.workspace.findFiles(
     `**/*.{${FILE_EXTENSIONS.join(',')}}`,
     EXCLUDE_GLOBS
   );
 
-  // Process each file once — streaming matches and mapping back to nodes
-  const limit = pLimit(DEFAULT_CONCURRENCY);
-  const filePromises = allWorkspaceFiles.map(fileUri =>
-    limit(async () => {
+  const filesToScan = uriHints.size > 0
+    ? allWorkspaceFiles.filter(u => uriHints.has(u.toString()))
+    : allWorkspaceFiles;
+
+  const filePromises = filesToScan.map(fileUri =>
+    workLimit(async () => {
       try {
         const fileKey = fileUri.toString();
+        const doc = await getDocumentCached(fileUri, documentCache);
         let text = fileTextCache.get(fileKey);
         if (text === undefined) {
-          const doc = await vscode.workspace.openTextDocument(fileUri);
           text = doc.getText();
           fileTextCache.set(fileKey, text);
         }
@@ -365,8 +400,6 @@ async function findCrossFileRelationshipsManually(
           const node = labelToNode.get(matchedLabel);
           if (!node) {continue;}
 
-          // Which symbol contains this position?
-          const doc = await vscode.workspace.openTextDocument(fileUri);
           const pos = doc.positionAt(match.index);
           const fromNodeId = findContainingSymbolId(fileKey, pos);
           if (fromNodeId && fromNodeId !== node.id && graph.nodes.has(fromNodeId)) {
@@ -376,10 +409,7 @@ async function findCrossFileRelationshipsManually(
           }
         }
       } catch {
-        // keep logs light for large workspaces
-        console.warn(
-          `[SaralFlow Graph] Could not scan file for manual relationships: ${fileUri.toString()}`
-        );
+        console.warn(`[SaralFlow Graph] Could not scan file for manual relationships: ${fileUri.toString()}`);
       }
     })
   );
@@ -389,7 +419,7 @@ async function findCrossFileRelationshipsManually(
 
 /**
  * Processes a single file, adds the File node and symbol nodes + CONTAINS edges.
- * Also starts embedding generation for nodes as they are created (pipelined).
+ * Also queues embeddings for symbol nodes (awaited at the very end of extractSemanticGraph).
  */
 async function processFileAndAddNodes(
   fileUri: vscode.Uri,
@@ -398,7 +428,7 @@ async function processFileAndAddNodes(
   fileTextCache: Map<string, string>,
   embeddingLimit: (fn: () => Promise<any>) => Promise<any>,
   newNodesCollector: INode[],
-  allEmbeddingPromises: Promise<void>[] // <-- NEW
+  allEmbeddingPromises: Promise<void>[]
 ): Promise<void> {
   const relativePath = vscode.workspace.asRelativePath(fileUri, true);
   const fileNodeId = fileUri.toString();
@@ -408,7 +438,7 @@ async function processFileAndAddNodes(
     const fileText = document.getText();
     fileTextCache.set(fileNodeId, fileText);
 
-    // Create File node
+    // File node
     const fileNode: INode = {
       id: fileNodeId,
       label: relativePath,
@@ -421,7 +451,7 @@ async function processFileAndAddNodes(
     graph.addNode(fileNode);
     newNodesCollector.push(fileNode);
 
-    // Pull document symbols
+    // Document symbols
     const documentSymbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
       'vscode.executeDocumentSymbolProvider',
       document.uri
@@ -444,17 +474,15 @@ async function processFileAndAddNodes(
             parentIds: [parentId],
             codeSnippet
           };
-
           graph.addNode(symbolNode);
           newNodesCollector.push(symbolNode);
           graph.addEdge({ from: parentId, to: symbolId, label: EdgeType.CONTAINS });
           symbolsInFile.push(symbolNode);
 
-          // Start embedding pipeline and track promise
+          // Embedding
           if (symbolNode.codeSnippet) {
             const textToEmbed = `${symbolNode.kind}: ${symbolNode.label}\n${symbolNode.detail || ''}\n${symbolNode.codeSnippet}`;
             const truncated = textToEmbed.length > 8000 ? textToEmbed.substring(0, 8000) : textToEmbed;
-
             const p = embeddingLimit(async () => {
               try {
                 const emb = await getEmbeddingViaCloudFunction(truncated, statToken);
@@ -466,8 +494,6 @@ async function processFileAndAddNodes(
             allEmbeddingPromises.push(p);
           }
         }
-
-        // Recurse into children
         if (symbol.children && symbol.children.length > 0) {
           symbol.children.forEach(child => processSymbol(child, symbolId));
         }
@@ -475,33 +501,20 @@ async function processFileAndAddNodes(
 
       documentSymbols.forEach(topLevel => processSymbol(topLevel, fileNodeId));
 
-      // Sort symbols for binary search
+      // Sort symbols for binary search in findContainingSymbolId
       symbolsInFile.sort((a, b) => {
-        if (!a.range || !b.range) return 0;
+        if (!a.range || !b.range) {return 0;}
         return a.range.start.line - b.range.start.line ||
                a.range.start.character - b.range.start.character;
       });
       fileSymbolsMap.set(fileUri.toString(), symbolsInFile);
     }
   } catch (error: any) {
-    console.error(`[SaralFlow Graph] Failed to process ${relativePath}: ${error.message}`);
+    console.error(`[SaralFlow Graph] Failed to process ${relativePath}: ${error?.message ?? error}`);
   }
 }
 
-/** Removes nodes/edges from the shared semanticGraph for a given file */
-export function removeFileNodesFromGraph(fileUri: vscode.Uri) {
-  const fileUriStr = fileUri.toString();
-  const nodesToRemove = Array.from(semanticGraph.nodes.values()).filter(
-    node => node.uri === fileUriStr
-  );
-  const removedNodeIds = new Set(nodesToRemove.map(node => node.id));
 
-  nodesToRemove.forEach(node => semanticGraph.nodes.delete(node.id));
-
-  semanticGraph.edges = semanticGraph.edges.filter(
-    edge => !removedNodeIds.has(edge.from) && !removedNodeIds.has(edge.to)
-  );
-}
 
 /**
  * Re-embed nodes in the graph that don't have embeddings (uses static key; no Firebase check).
