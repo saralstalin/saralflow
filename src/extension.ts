@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { CodeGraph,  INode } from './graphTypes'; 
 import { getEmbeddingViaCloudFunction, cosineSimilarity } from'./embeddingService';
-import {extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, statToken} from './graphBuilder';
+import {extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, statToken, graphBuildInProgress, pendingFileChanges} from './graphBuilder';
 const config = vscode.workspace.getConfiguration('saralflow');
 
 const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeUrl') 
@@ -20,6 +20,8 @@ let isGraphBuilding = false;
 // Global variable to store the Firebase ID Token received from the webview
 export let firebaseIdToken: string | null = null;
 let firebaseTokenPromiseResolve: ((value: string) => void) | null = null;
+// Create a status bar item for SaralFlow
+const saralCodeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
 
 
 // Define the expected structure of the Cloud Function's response for generateCode
@@ -47,39 +49,14 @@ export function activate(vsContext: vscode.ExtensionContext) {
     };
     checkTokenOnStartup();
 
-    // Create a status bar item for SaralFlow
-    const saralCodeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+    
     saralCodeStatusBarItem.text = `$(robot) Saralflow`;
     saralCodeStatusBarItem.tooltip = 'Show Saral flow';
     saralCodeStatusBarItem.command = 'SaralFlow.openGenerator';
     saralCodeStatusBarItem.show();
     extensionContext.subscriptions.push(saralCodeStatusBarItem);
 
-    // Helper to run a graph build with status bar progress updates
-    async function buildGraphWithStatus(filesToProcess?: vscode.Uri[]) {
-        try {
-            saralCodeStatusBarItem.text = "$(sync~spin) Saralflow: Starting...";
-            saralCodeStatusBarItem.tooltip = "Building semantic graph...";
-
-            semanticGraph = await extractSemanticGraph(filesToProcess, (msg) => {
-                saralCodeStatusBarItem.text = `$(sync~spin) Saralflow: ${msg}`;
-                saralCodeStatusBarItem.tooltip = msg;
-            });
-
-            saralCodeStatusBarItem.text = "$(check) Saralflow";
-            saralCodeStatusBarItem.tooltip = "Graph build complete";
-        } catch (e: any) {
-            saralCodeStatusBarItem.text = "$(error) Saralflow";
-            saralCodeStatusBarItem.tooltip = "Graph build failed";
-            vscode.window.showErrorMessage(`SaralFlow: Graph build failed: ${e.message}`);
-            console.error(`[SaralFlow] Graph build failed: ${e.message}`);
-        } finally {
-            setTimeout(() => {
-                saralCodeStatusBarItem.text = "$(robot) Saralflow";
-                saralCodeStatusBarItem.tooltip = "Show Saral flow";
-            }, 4000);
-        }
-    }
+    
 
     // *** Initial Graph Building on Activation ***
     let buildGraphDisposable = vscode.commands.registerCommand('SaralFlow.buildGraphOnStartup', async () => {
@@ -278,23 +255,28 @@ export function activate(vsContext: vscode.ExtensionContext) {
     const changedUris = new Set<vscode.Uri>();
 
     const debouncedGraphUpdate = (uri: vscode.Uri) => {
-        changedUris.add(uri);
+        if (graphBuildInProgress) {
+            // Initial build still running → buffer this change
+            pendingFileChanges.add(uri);
+            return;
+        }
 
+        changedUris.add(uri);
         if (graphUpdateTimeout) {
             clearTimeout(graphUpdateTimeout);
         }
         graphUpdateTimeout = setTimeout(async () => {
             const urisToProcess = Array.from(changedUris);
             console.log(`[SaralFlow Graph] Debounce triggered. Processing ${urisToProcess.length} files.`);
-            await buildGraphWithStatus(urisToProcess); // Shows progress in status bar
+            await buildGraphWithStatus(urisToProcess);
             changedUris.clear();
 
             if (graphPanel) {
-                graphPanel.webview.postMessage({
-                    command: 'renderGraph',
-                    nodes: semanticGraph.nodes,
-                    edges: semanticGraph.edges
-                });
+            graphPanel.webview.postMessage({
+                command: 'renderGraph',
+                nodes: semanticGraph.nodes,
+                edges: semanticGraph.edges
+            });
             }
         }, 4000);
     };
@@ -306,6 +288,32 @@ export function activate(vsContext: vscode.ExtensionContext) {
     });
 }
 
+
+// Helper to run a graph build with status bar progress updates
+export async function buildGraphWithStatus(filesToProcess?: vscode.Uri[]) {
+    try {
+        saralCodeStatusBarItem.text = "$(sync~spin) Saralflow: Starting...";
+        saralCodeStatusBarItem.tooltip = "Building semantic graph...";
+
+        semanticGraph = await extractSemanticGraph(filesToProcess, (msg) => {
+            saralCodeStatusBarItem.text = `$(sync~spin) Saralflow: ${msg}`;
+            saralCodeStatusBarItem.tooltip = msg;
+        });
+
+        saralCodeStatusBarItem.text = "$(check) Saralflow";
+        saralCodeStatusBarItem.tooltip = "Graph build complete";
+    } catch (e: any) {
+        saralCodeStatusBarItem.text = "$(error) Saralflow";
+        saralCodeStatusBarItem.tooltip = "Graph build failed";
+        vscode.window.showErrorMessage(`SaralFlow: Graph build failed: ${e.message}`);
+        console.error(`[SaralFlow] Graph build failed: ${e.message}`);
+    } finally {
+        setTimeout(() => {
+            saralCodeStatusBarItem.text = "$(robot) Saralflow";
+            saralCodeStatusBarItem.tooltip = "Show Saral flow";
+        }, 4000);
+    }
+}
 
 
 export function deactivate() {

@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph, INode, EdgeType, generateNodeId } from './graphTypes';
 import { getEmbeddingViaCloudFunction } from './embeddingService';
-import { semanticGraph } from './extension';
+import { semanticGraph, buildGraphWithStatus  } from './extension';
 import pLimit from 'p-limit';
 
 // ===== Tunables =====
@@ -13,8 +13,16 @@ const DEFAULT_CONCURRENCY = Math.max(4, Math.floor(CPU_COUNT * 1.5)); // adaptiv
 const EMBEDDING_CONCURRENCY = Math.max(4, Math.floor(CPU_COUNT)); 
 const GRAPH_CACHE_NAME = '.vscode/.s2c-graph-cache.json';
 const initialLSPWaitTimeMs = 12_000;
+export let graphBuildInProgress = false;
+export const pendingFileChanges = new Set<vscode.Uri>();
 
-const FILE_EXTENSIONS = ['ts', 'tsx', 'js', 'jsx', 'cs', 'py', 'sql', 'json', 'md', 'ipynb'];
+const FILE_EXTENSIONS = [
+  'ts', 'tsx', 'js', 'jsx',   // Frontend & Node
+  'cs', 'py', 'sql',          // Backend & data
+  'json', 'md', 'ipynb',      // Config, docs, notebooks
+  'html', 'css', 'scss',      // Angular/React templates & styles
+  'vue'                       // Vue SFCs
+];
 const EXCLUDE_GLOBS = '{**/node_modules/**,**/bin/**,**/obj/**,**/__pycache__/**,**/.venv/**}';
 
 export const statToken = '9XtremeThermo$teel';
@@ -151,6 +159,7 @@ export async function extractSemanticGraph(
     return new CodeGraph();
   }
 
+  graphBuildInProgress = true;
   const graph = semanticGraph;
   const documentCache: DocumentCache = new Map();
   const fileTextCache: Map<string, string> = new Map();
@@ -268,11 +277,33 @@ export async function extractSemanticGraph(
     } 
   );
 
+  const totalEmbeddings = allEmbeddingPromises.length;
+  let completedEmbeddings = 0;
+
   // Await embeddings
   onProgress?.('Finalizing embeddings...');
-  await Promise.all(allEmbeddingPromises);
+  await Promise.all(
+    allEmbeddingPromises.map(p =>
+      p.then(() => {
+        completedEmbeddings++;
+        // update every 10 embeddings or at the end
+        if (completedEmbeddings % 10 === 0 || completedEmbeddings === totalEmbeddings) {
+          onProgress?.(
+            `Embedded ${completedEmbeddings}/${totalEmbeddings} nodes`
+          );
+        }
+      })
+    )
+  );
 
-  // Save after build/update
+  if (pendingFileChanges.size > 0) {
+    const uris = Array.from(pendingFileChanges);
+    pendingFileChanges.clear();
+    await buildGraphWithStatus(uris);
+  }
+
+  graphBuildInProgress = false;
+    // Save after build/update
   saveGraphToCache(graph);
 
   onProgress?.(`Graph build complete (${graph.nodes.size} nodes, ${graph.edges.length} edges)`);
