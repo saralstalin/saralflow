@@ -3,7 +3,7 @@
   "displayName": "SaralFlow - Developer Preview",
   "publisher": "SaralStalin",
   "description": "Auto generate code changes from story description",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "engines": {
     "vscode": "^1.102.0"
   },
@@ -45,6 +45,39 @@
           "type": "string",
           "default": "https://us-central1-saralflowapis.cloudfunctions.net/generateEmbedding",
           "description": "The URL for the SaralFlow 'generateEmbedding' Cloud Function."
+        },
+        "saralflow.graph.include": {
+          "type": "array",
+          "default": ["**/*"],
+          "description": "Glob patterns to include for graph building. Defaults to all supported source files."
+        },
+        "saralflow.graph.exclude": {
+          "type": "array",
+          "default": [
+            "**/node_modules/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/out/**",
+            "**/.next/**",
+            "**/.nuxt/**",
+            "**/bin/**",
+            "**/obj/**",
+            "**/__pycache__/**",
+            "**/.venv/**",
+            "**/.vscode",
+            "**/*.min.js",
+            "**/*.min.css",
+            "**/*.bundle.js",
+            "**/*.chunk.js",
+            "**/*.map",
+            "**/*.d.ts",
+            "**/*.spec.{ts,js}",
+            "**/*.test.{ts,js}",
+            "**/angular.json",
+            "**/package-lock.json",
+            "**/yarn.lock"
+          ],
+          "description": "Glob patterns to exclude from graph building."
         }
       }
     }
@@ -79,14 +112,16 @@
     "eslint": "^9.25.1",
     "npm-run-all": "^4.1.5",
     "typescript": "^5.8.3",
-    "vsce": "^2.11.0"
+    "vsce": "^2.11.0",
+    "@types/minimatch": "^5.1.2"
   },
   "dependencies": {
     "diff-match-patch": "^1.0.5",
     "firebase": "^12.0.0",
     "marked": "^16.1.1",
     "node-fetch": "^2.7.0",
-    "openai": "^5.10.2"
+    "openai": "^5.10.2",
+    "minimatch": "^9.0.3"
   },
   "repository": {
     "type": "git",

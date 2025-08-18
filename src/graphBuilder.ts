@@ -6,6 +6,7 @@ import { CodeGraph, INode, EdgeType, generateNodeId } from './graphTypes';
 import { getEmbeddingViaCloudFunction } from './embeddingService';
 import { semanticGraph, buildGraphWithStatus  } from './extension';
 import pLimit from 'p-limit';
+import {minimatch} from "minimatch";
 
 // ===== Tunables =====
 const CPU_COUNT = Math.max(1, os.cpus?.().length || 4);
@@ -23,7 +24,71 @@ const FILE_EXTENSIONS = [
   'html', 'css', 'scss',      // Angular/React templates & styles
   'vue'                       // Vue SFCs
 ];
-const EXCLUDE_GLOBS = '{**/node_modules/**,**/bin/**,**/obj/**,**/__pycache__/**,**/.venv/**}';
+
+
+function normalizePatterns(value: string | string[] | undefined, defaults: string[]): string[] {
+  if (!value) {return defaults;}
+  if (Array.isArray(value)) {return value;}
+  return [value]; // wrap single string into array
+}
+
+function getGraphGlobs() {
+  const cfg = vscode.workspace.getConfiguration('saralflow');
+
+  const includeRaw = cfg.get<string[] | string>("graph.include", ["**/*"]);
+  const excludeRaw = cfg.get<string[] | string>("graph.exclude", [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/out/**",
+    "**/.next/**",
+    "**/.nuxt/**",
+    "**/bin/**",
+    "**/obj/**",
+    "**/__pycache__/**",
+    "**/.venv/**",
+    "**/.vscode",
+    "**/*.min.js",
+    "**/*.min.css",
+    "**/*.bundle.js",
+    "**/*.chunk.js",
+    "**/*.map",
+    "**/*.d.ts",
+    "**/*.spec.{ts,js}",
+    "**/*.test.{ts,js}",
+    "**/angular.json",
+    "**/package-lock.json",
+    "**/yarn.lock"
+  ]);
+
+  const includeGlobs = normalizePatterns(includeRaw, ["**/*"]);
+  const excludeGlobs = normalizePatterns(excludeRaw, []);
+
+  // Apply FILE_EXTENSIONS filter
+  const includeWithExtensions = includeGlobs.map(glob =>
+    glob.endsWith("/") || glob.endsWith("**")
+      ? `${glob}/**/*.{${FILE_EXTENSIONS.join(',')}}`
+      : `${glob}.{${FILE_EXTENSIONS.join(',')}}`
+  );
+
+  return { includeWithExtensions, excludeGlobs };
+}
+
+function isExcluded(uri: vscode.Uri, excludePatterns: string[]): boolean {
+  return excludePatterns.some(pattern => minimatch(uri.fsPath, pattern, { matchBase: true }));
+}
+
+async function findWorkspaceFiles(
+  includePatterns: string[],
+  excludePatterns: string[]
+): Promise<vscode.Uri[]> {
+  const results: vscode.Uri[] = [];
+  for (const include of includePatterns) {
+    const matches = await vscode.workspace.findFiles(include); // no exclude here
+    results.push(...matches);
+  }
+  return results.filter(uri => !isExcluded(uri, excludePatterns));
+}
 
 export const statToken = '9XtremeThermo$teel';
 
@@ -196,10 +261,8 @@ export async function extractSemanticGraph(
     onProgress?.('Waiting for LSP load...');
     await new Promise(resolve => setTimeout(resolve, initialLSPWaitTimeMs));
     onProgress?.('Learning your project...');
-    const files = await vscode.workspace.findFiles(
-      `**/*.{${FILE_EXTENSIONS.join(',')}}`,
-      EXCLUDE_GLOBS
-    );
+    const { includeWithExtensions, excludeGlobs  } = getGraphGlobs();
+    const files = await findWorkspaceFiles(includeWithExtensions, excludeGlobs );
     if (files.length === 0) {
       onProgress?.('No matching files found');
       return graph;
@@ -495,10 +558,8 @@ async function findCrossFileRelationshipsManually(
   for (const n of nodesToSearchFor) {
     if (n.uri) { uriHints.add(n.uri); }
   }
-  const allWorkspaceFiles = await vscode.workspace.findFiles(
-    `**/*.{${FILE_EXTENSIONS.join(',')}}`,
-    EXCLUDE_GLOBS
-  );
+  const { includeWithExtensions, excludeGlobs  } = getGraphGlobs();
+  const allWorkspaceFiles = await findWorkspaceFiles(includeWithExtensions, excludeGlobs );
   const filesToScan = uriHints.size > 0
     ? allWorkspaceFiles.filter(u => uriHints.has(u.toString()))
     : allWorkspaceFiles;
