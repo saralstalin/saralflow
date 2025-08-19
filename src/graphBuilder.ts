@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph, INode, EdgeType, generateNodeId } from './graphTypes';
 import { getEmbeddingViaCloudFunction } from './embeddingService';
-import { semanticGraph, buildGraphWithStatus  } from './extension';
+import { semanticGraph, buildGraphWithStatus, suppressPathOnce  } from './extension';
 import pLimit from 'p-limit';
 import {minimatch} from "minimatch";
 
@@ -25,6 +25,53 @@ const FILE_EXTENSIONS = [
   'vue'                       // Vue SFCs
 ];
 
+const MAX_EMBED_CHARS = 24000;        // ~6k tokens ballpark
+const MAX_SNIPPET_CHARS = 12000;      // cap for single symbol snippet
+const MAX_FILE_EMBED_CHARS = 4000;    // file "summary" cap
+const RETRY_EMBED_CHARS = 8000;       // fallback size if API complains
+
+function safeSlice(s: string, max: number) {
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function isMaxContextError(e: unknown): boolean {
+  const msg = String((e as any)?.message ?? (e as any)?.error ?? e ?? '');
+  return /maximum context length|requested \d+ tokens/i.test(msg);
+}
+
+
+function buildEmbeddingPayload(node: INode, fullTextForFile: string, symbolNodesInFile: INode[]): string {
+  const header = `${node.kind}: ${node.label}\nURI: ${node.uri}\n`;
+
+  if (node.kind === 'File') {
+    // Build a compact "file summary": imports + top-level symbol names/kinds
+    const imports = (fullTextForFile.match(/^(?:\s*import\s.+|#include\s.+|from\s.+\simport\s.+)/gmi) || [])
+      .slice(0, 100)
+      .join('\n');
+
+    const topSymbols = symbolNodesInFile
+      .filter(s => s.uri === node.uri)
+      .slice(0, 200)
+      .map(s => `${s.kind}:${s.label}`)
+      .join('\n');
+
+    const body = [imports, '--- symbols ---', topSymbols].filter(Boolean).join('\n');
+    return safeSlice(header + body, MAX_FILE_EMBED_CHARS);
+  }
+
+  // For symbol nodes, prefer the symbol’s own snippet; if missing, fall back lightly
+  const snippet = node.codeSnippet ?? '';
+  let body = snippet;
+
+  // Long symbol bodies: keep head + tail to preserve signature & usage cues
+  if (body.length > MAX_SNIPPET_CHARS) {
+    const head = body.slice(0, Math.floor(MAX_SNIPPET_CHARS * 0.7));
+    const tail = body.slice(-Math.floor(MAX_SNIPPET_CHARS * 0.3));
+    body = `${head}\n…\n${tail}`;
+  }
+
+  return safeSlice(header + body, MAX_EMBED_CHARS);
+}
 
 function normalizePatterns(value: string | string[] | undefined, defaults: string[]): string[] {
   if (!value) {return defaults;}
@@ -32,7 +79,7 @@ function normalizePatterns(value: string | string[] | undefined, defaults: strin
   return [value]; // wrap single string into array
 }
 
-function getGraphGlobs() {
+export function getGraphGlobs() {
   const cfg = vscode.workspace.getConfiguration('saralflow');
 
   const includeRaw = cfg.get<string[] | string>("graph.include", ["**/*"]);
@@ -47,7 +94,8 @@ function getGraphGlobs() {
     "**/obj/**",
     "**/__pycache__/**",
     "**/.venv/**",
-    "**/.vscode",
+    "**/.vscode/**",
+    "**/.angular/**",
     "**/*.min.js",
     "**/*.min.css",
     "**/*.bundle.js",
@@ -74,8 +122,27 @@ function getGraphGlobs() {
   return { includeWithExtensions, excludeGlobs };
 }
 
+function isFolderExcludeGlob(p: string): boolean {
+  // Safe to combine if it targets a folder tree and uses no brace alternation
+  // Examples: **/node_modules/**, **/.vscode/**, **/dist/**, **/.angular/**
+  return p.endsWith("/**") && !p.includes("{") && !p.includes("}");
+}
+
+function combineFolderExcludesForVscode(excludePatterns: string[]): string | undefined {
+  const folderOnly = Array.from(new Set(excludePatterns.filter(isFolderExcludeGlob)));
+  if (folderOnly.length === 0) {return undefined;}
+
+  // Combine into a single brace group without nesting inner braces
+  // e.g. {**/node_modules/**,**/.vscode/**,**/dist/**}
+  return `{${folderOnly.join(",")}}`;
+}
+
 function isExcluded(uri: vscode.Uri, excludePatterns: string[]): boolean {
-  return excludePatterns.some(pattern => minimatch(uri.fsPath, pattern, { matchBase: true }));
+  const posix = uri.fsPath.replace(/\\/g, "/");
+  const nocase = process.platform === "win32"; // Windows FS is case-insensitive
+  return excludePatterns.some(pattern =>
+    minimatch(posix, pattern, { dot: true, nocase })
+  );
 }
 
 async function findWorkspaceFiles(
@@ -83,10 +150,22 @@ async function findWorkspaceFiles(
   excludePatterns: string[]
 ): Promise<vscode.Uri[]> {
   const results: vscode.Uri[] = [];
+  const excludeCombined = combineFolderExcludesForVscode(excludePatterns);
+
+  // Try with folder-level excludes first (fast path)
   for (const include of includePatterns) {
-    const matches = await vscode.workspace.findFiles(include); // no exclude here
-    results.push(...matches);
+    try {
+      const matches = await vscode.workspace.findFiles(include, excludeCombined);
+      results.push(...matches);
+    } catch (err) {
+      // Fallback: if the glob engine complains, retry without excludes
+      console.warn("[SaralFlow Graph] findFiles exclude combine failed; retrying without exclude.", err);
+      const matches = await vscode.workspace.findFiles(include);
+      results.push(...matches);
+    }
   }
+
+  // Final safety net: apply the full exclude list (including file-level patterns)
   return results.filter(uri => !isExcluded(uri, excludePatterns));
 }
 
@@ -131,6 +210,9 @@ function saveGraphToCache(graph: CodeGraph) {
   };
 
   try {
+    fs.writeFileSync(cachePath, JSON.stringify(cacheData), 'utf8');
+
+    suppressPathOnce(path.resolve(cachePath));
     fs.writeFileSync(cachePath, JSON.stringify(cacheData), 'utf8');
   } catch (err) {
     console.warn(`[SaralFlow Graph] Failed to write cache: ${err}`);
@@ -751,11 +833,21 @@ async function processFileAndAddNodes(
     const queueEmbeddings = (nodes: INode[]) => {
       for (const node of nodes) {
         if (!node.embedding || node.embedding.length === 0) {
-          const payload = `${node.label}\n\n${node.codeSnippet ?? fullText}`;
           const p = embeddingLimit(async () => {
             try {
-              const emb = await getEmbeddingViaCloudFunction(payload, statToken);
-              node.embedding = Array.isArray(emb) ? emb : [];
+              const payload = buildEmbeddingPayload(node, fullText, symbolNodes);
+              try {
+                const emb = await getEmbeddingViaCloudFunction(payload, statToken);
+                node.embedding = Array.isArray(emb) ? emb : [];
+              } catch (e) {
+                if (isMaxContextError(e)) {
+                  const shorter = safeSlice(payload, RETRY_EMBED_CHARS);
+                  const emb2 = await getEmbeddingViaCloudFunction(shorter, statToken);
+                  node.embedding = Array.isArray(emb2) ? emb2 : [];
+                } else {
+                  throw e;
+                }
+              }
             } catch (e) {
               console.warn(`[SaralFlow Graph] Embedding failed for ${node.id}:`, e);
               node.embedding = [];

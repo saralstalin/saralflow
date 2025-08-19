@@ -3,13 +3,16 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { CodeGraph,  INode } from './graphTypes'; 
 import { getEmbeddingViaCloudFunction, cosineSimilarity } from'./embeddingService';
-import {extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, statToken, graphBuildInProgress, pendingFileChanges} from './graphBuilder';
+import {extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, statToken, graphBuildInProgress, pendingFileChanges, getGraphGlobs} from './graphBuilder';
 const config = vscode.workspace.getConfiguration('saralflow');
+import {minimatch} from "minimatch";
 
 const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeUrl') 
                                      || 'https://us-central1-saralflowapis.cloudfunctions.net/generateCode';
 
 const DiffMatchPatch: any = require('diff-match-patch'); 
+
+export const suppressedWrites = new Set<string>();
 // Declare panel globally so it can be reused or disposed
 let graphPanel: vscode.WebviewPanel | undefined = undefined;
 let codeViewPanel: vscode.WebviewPanel | undefined = undefined;
@@ -23,12 +26,34 @@ let firebaseTokenPromiseResolve: ((value: string) => void) | null = null;
 // Create a status bar item for SaralFlow
 const saralCodeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
 
-
 // Define the expected structure of the Cloud Function's response for generateCode
 interface GenerateCodeResponse {
     success: boolean;
     text?: string; // Content for successful code generation
     error?: string; // Error message if success is false
+}
+
+export function suppressPathOnce(absPath: string, ms = 1500) {
+    suppressedWrites.add(absPath);
+    setTimeout(() => suppressedWrites.delete(absPath), ms);
+}
+
+function shouldIgnoreEvent(uri: vscode.Uri): boolean {
+    const { excludeGlobs } = getGraphGlobs(); // your existing config reader
+    const posix = uri.fsPath.replace(/\\/g, '/');
+    const nocase = process.platform === 'win32';
+
+    // ignore excluded globs
+    if (excludeGlobs.some(p => minimatch(posix, p, { dot: true, nocase }))) {
+        return true;
+    }
+
+    // ignore our own suppressed write (e.g. saving graph cache)
+    if (suppressedWrites.has(path.resolve(uri.fsPath))) {
+        return true;
+    }
+
+    return false;
 }
 
 export function activate(vsContext: vscode.ExtensionContext) {
@@ -248,13 +273,18 @@ export function activate(vsContext: vscode.ExtensionContext) {
     }));
 
     // File system watcher for incremental updates
-    const codeFileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx,cs,py,sql,yaml}', false, false, false);
+    const codeFileWatcher = vscode.workspace.createFileSystemWatcher('**/*.{ts,tsx,js,jsx,cs,py,sql,yaml,html,ipynb}', false, false, false);
     extensionContext.subscriptions.push(codeFileWatcher);
 
     let graphUpdateTimeout: NodeJS.Timeout | undefined;
     const changedUris = new Set<vscode.Uri>();
 
     const debouncedGraphUpdate = (uri: vscode.Uri) => {
+        
+        if (shouldIgnoreEvent(uri)) {
+            return; // skip excluded/self paths
+        }
+        
         if (graphBuildInProgress) {
             // Initial build still running → buffer this change
             pendingFileChanges.add(uri);
@@ -272,11 +302,11 @@ export function activate(vsContext: vscode.ExtensionContext) {
             changedUris.clear();
 
             if (graphPanel) {
-            graphPanel.webview.postMessage({
-                command: 'renderGraph',
-                nodes: semanticGraph.nodes,
-                edges: semanticGraph.edges
-            });
+                graphPanel.webview.postMessage({
+                    command: 'renderGraph',
+                    nodes: semanticGraph.nodes,
+                    edges: semanticGraph.edges
+                });
             }
         }, 4000);
     };
@@ -565,7 +595,7 @@ function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
     }
 
     const relevantNodes: { node: INode, score: number }[] = [];
-    const topN = 10; // Number of top relevant nodes to include as context
+    const topN = 5; // Number of top relevant nodes to include as context
 
     // Iterate over the values of the Map
     for (const node of semanticGraph.nodes.values()) {
