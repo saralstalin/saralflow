@@ -45,7 +45,7 @@ export function cosineSimilarity(vec1: number[], vec2: number[]): number {
 
 
 /***
- * Generates an embedding for the given text by calling the Cloud Function.
+ * Generates an embedding for the given text by calling the Cloud Function. 
  * @param text The text to embed.
  * @param firebaseIdToken The Firebase ID token for authentication.
  * @returns A promise that resolves to the embedding vector (number[]) or null if an error occurs.

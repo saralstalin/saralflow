@@ -16,7 +16,7 @@ This VS Code extension helps you go from a high-level **natural language story**
 
 1.  Open a workspace/folder containing your code.
 
-2.  Click the `SaralFlow` button in the VS Code activity bar to launch the panel.
+2.  Click the `SaralFlow` button in the VS Code Status bar to launch the panel.
 
 3.  In the new webview panel, describe the feature or change you want to implement.
 

@@ -1,16 +1,17 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { CodeGraph,  INode } from './graphTypes'; 
-import { getEmbeddingViaCloudFunction, cosineSimilarity } from'./embeddingService';
-import {extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, statToken, graphBuildInProgress, pendingFileChanges, getGraphGlobs} from './graphBuilder';
+import { CodeGraph, INode } from './graphTypes';
+import { getEmbeddingViaCloudFunction, cosineSimilarity } from './embeddingService';
+import { extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, statToken, graphBuildInProgress, pendingFileChanges, getGraphGlobs } from './graphBuilder';
 const config = vscode.workspace.getConfiguration('saralflow');
-import {minimatch} from "minimatch";
+import { minimatch } from "minimatch";
+import { GraphSearch } from './graphSearch';
 
-const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeUrl') 
-                                     || 'https://us-central1-saralflowapis.cloudfunctions.net/generateCode';
+const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeUrl')
+    || 'https://us-central1-saralflowapis.cloudfunctions.net/generateCode';
 
-const DiffMatchPatch: any = require('diff-match-patch'); 
+const DiffMatchPatch: any = require('diff-match-patch');
 
 export const suppressedWrites = new Set<string>();
 // Declare panel globally so it can be reused or disposed
@@ -25,6 +26,62 @@ export let firebaseIdToken: string | null = null;
 let firebaseTokenPromiseResolve: ((value: string) => void) | null = null;
 // Create a status bar item for SaralFlow
 const saralCodeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+let graphSearch: GraphSearch | undefined;
+
+// Track which nodes came from which file so we can remove missing ones on rebuild
+const fileToNodeIds = new Map<string, Set<string>>(); // key: uri.toString()
+
+function getNodesForUri(uriStr: string): INode[] {
+    // semanticGraph.nodes is a Map<string, INode>
+    const out: INode[] = [];
+    for (const n of semanticGraph.nodes.values()) {
+        if (n.uri === uriStr) { out.push(n); }
+    }
+    return out;
+}
+
+/** Sync the index for a single file's nodes (add/update/remove) */
+function syncIndexForFile(uriStr: string) {
+    if (!graphSearch) { return; }
+    const currentNodes = getNodesForUri(uriStr);
+
+    // Current ids present in the graph after the rebuild
+    const currentIds = new Set<string>();
+    for (const n of currentNodes) {
+        currentIds.add(n.id);
+        if (n.embedding && n.embedding.length) {
+            graphSearch.upsertNode(n);        // add or update
+        } else {
+            graphSearch.removeNode(n.id);     // node lost its embedding
+        }
+    }
+
+    // Anything that used to exist for this file but no longer does -> remove
+    const prev = fileToNodeIds.get(uriStr) ?? new Set<string>();
+    for (const oldId of prev) {
+        if (!currentIds.has(oldId)) {
+            graphSearch.removeNode(oldId);
+        }
+    }
+
+    // Save current snapshot
+    fileToNodeIds.set(uriStr, currentIds);
+}
+
+/** On file delete: remove all nodes that belonged to that file */
+function removeFileFromIndex(uriStr: string) {
+    if (!graphSearch) { return; }
+    const prev = fileToNodeIds.get(uriStr);
+    if (prev) {
+        for (const id of prev) { graphSearch.removeNode(id); }
+        fileToNodeIds.delete(uriStr);
+    } else {
+        // Fallback: scan nodes once if we had no record (rare)
+        for (const n of semanticGraph.nodes.values()) {
+            if (n.uri === uriStr) { graphSearch.removeNode(n.id); }
+        }
+    }
+}
 
 // Define the expected structure of the Cloud Function's response for generateCode
 interface GenerateCodeResponse {
@@ -74,14 +131,14 @@ export function activate(vsContext: vscode.ExtensionContext) {
     };
     checkTokenOnStartup();
 
-    
+
     saralCodeStatusBarItem.text = `$(robot) Saralflow`;
     saralCodeStatusBarItem.tooltip = 'Show Saral flow';
     saralCodeStatusBarItem.command = 'SaralFlow.openGenerator';
     saralCodeStatusBarItem.show();
     extensionContext.subscriptions.push(saralCodeStatusBarItem);
 
-    
+
 
     // *** Initial Graph Building on Activation ***
     let buildGraphDisposable = vscode.commands.registerCommand('SaralFlow.buildGraphOnStartup', async () => {
@@ -93,6 +150,15 @@ export function activate(vsContext: vscode.ExtensionContext) {
         console.log('[SaralFlow] Initial graph build triggered.');
         try {
             await buildGraphWithStatus(); // Uses progress updates
+
+            graphSearch = new GraphSearch(semanticGraph);
+
+            fileToNodeIds.clear();
+            for (const n of semanticGraph.nodes.values()) {
+                const key = n.uri;
+                if (!fileToNodeIds.has(key)) { fileToNodeIds.set(key, new Set<string>()); }
+                fileToNodeIds.get(key)!.add(n.id);
+            }
 
             // If a panel is already open, update it
             if (graphPanel) {
@@ -224,13 +290,13 @@ export function activate(vsContext: vscode.ExtensionContext) {
         const maxSnippets = 10;
 
         for (const node of relevantNodes) {
-            if (snippetCount >= maxSnippets) {break;}
+            if (snippetCount >= maxSnippets) { break; }
             const snippet = await getCodeSnippet(node);
             if (snippet.trim() !== '' && !snippet.startsWith('// Error retrieving') && !snippet.startsWith('// No code snippet')) {
                 contextForLLM += `// File: ${vscode.workspace.asRelativePath(vscode.Uri.parse(node.uri))}\n`;
                 contextForLLM += `// Element: ${node.label} (Kind: ${node.kind})\n`;
                 contextForLLM += `// ID: ${node.id}\n`;
-                contextForLLM += `\`\`\`${node.uri.endsWith('.cs') ? 'csharp' : node.uri.endsWith('.ts') ? 'typescript': node.uri.endsWith('.sql') ? 'sql' : node.uri.endsWith('.py') ? 'python' : 'plaintext'}\n`;
+                contextForLLM += `\`\`\`${node.uri.endsWith('.cs') ? 'csharp' : node.uri.endsWith('.ts') ? 'typescript' : node.uri.endsWith('.sql') ? 'sql' : node.uri.endsWith('.py') ? 'python' : 'plaintext'}\n`;
                 contextForLLM += snippet;
                 contextForLLM += `\n\`\`\`\n\n`;
                 snippetCount++;
@@ -263,7 +329,7 @@ export function activate(vsContext: vscode.ExtensionContext) {
             ignoreFocusOut: true,
         });
 
-        if (!userStory) {return;}
+        if (!userStory) { return; }
         await proposeCodeFromStory(userStory);
     }));
 
@@ -280,26 +346,30 @@ export function activate(vsContext: vscode.ExtensionContext) {
     const changedUris = new Set<vscode.Uri>();
 
     const debouncedGraphUpdate = (uri: vscode.Uri) => {
-        
-        if (shouldIgnoreEvent(uri)) {
-            return; // skip excluded/self paths
-        }
-        
+        if (shouldIgnoreEvent(uri)) { return; }
+
         if (graphBuildInProgress) {
-            // Initial build still running → buffer this change
             pendingFileChanges.add(uri);
             return;
         }
 
         changedUris.add(uri);
-        if (graphUpdateTimeout) {
-            clearTimeout(graphUpdateTimeout);
-        }
+        if (graphUpdateTimeout) { clearTimeout(graphUpdateTimeout); }
+
         graphUpdateTimeout = setTimeout(async () => {
             const urisToProcess = Array.from(changedUris);
             console.log(`[SaralFlow Graph] Debounce triggered. Processing ${urisToProcess.length} files.`);
-            await buildGraphWithStatus(urisToProcess);
+
+            await buildGraphWithStatus(urisToProcess);  // <- your partial rebuild
             changedUris.clear();
+
+            // ✅ Incrementally sync the cosine index for just these files
+            for (const u of urisToProcess) {
+                syncIndexForFile(u.toString());
+            }
+
+            // Optional: compact occasionally (tombstones → dense)
+            // if (Math.random() < 0.05) graphSearch?.compact();
 
             if (graphPanel) {
                 graphPanel.webview.postMessage({
@@ -313,8 +383,10 @@ export function activate(vsContext: vscode.ExtensionContext) {
 
     codeFileWatcher.onDidChange(debouncedGraphUpdate);
     codeFileWatcher.onDidCreate(debouncedGraphUpdate);
+
     codeFileWatcher.onDidDelete(async (uri) => {
-        await removeFileNodesFromGraph(uri);
+        await removeFileNodesFromGraph(uri);        // your existing graph mutation
+        removeFileFromIndex(uri.toString());        // ✅ keep cosine index in sync
     });
 }
 
@@ -382,8 +454,7 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
         if (node.label.toLowerCase().includes(lowerCaseQuery) ||
             node.kind.toLowerCase().includes(lowerCaseQuery) ||
             node.id.toLowerCase().includes(lowerCaseQuery) ||
-            node.uri.toLowerCase().includes(lowerCaseQuery))
-        {
+            node.uri.toLowerCase().includes(lowerCaseQuery)) {
             isMatch = true;
         }
 
@@ -589,25 +660,22 @@ async function proposeCodeFromStory(userStory: string) {
 }
 
 function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
-    // Check if the semantic graph is initialized and has nodes
-    if (!semanticGraph || semanticGraph.nodes.size === 0) { 
-        return []; 
+    const topN = 5;
+
+    if (graphSearch) {
+        return graphSearch.search(storyEmbedding, topN).map(h => h.node);
     }
 
-    const relevantNodes: { node: INode, score: number }[] = [];
-    const topN = 5; // Number of top relevant nodes to include as context
-
-    // Iterate over the values of the Map
+    // Fallback (rare)
+    if (!semanticGraph || semanticGraph.nodes.size === 0) { return []; }
+    const scored = [];
     for (const node of semanticGraph.nodes.values()) {
-        if (node.embedding) {
-            const similarity = cosineSimilarity(storyEmbedding, node.embedding);
-            relevantNodes.push({ node, score: similarity });
-        }
+        if (!node.embedding) { continue; }
+        const s = cosineSimilarity(storyEmbedding, node.embedding);
+        scored.push({ node, s });
     }
-
-    relevantNodes.sort((a, b) => b.score - a.score);
-
-    return relevantNodes.slice(0, topN).map(r => r.node);
+    scored.sort((a, b) => b.s - a.s);
+    return scored.slice(0, topN).map(x => x.node);
 }
 
 function openSaralFlowWebview(extensionUri: vscode.Uri) {
@@ -638,7 +706,7 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                 return; // Exit the function gracefully
             }
             switch (message.command) {
-                 case 'firebaseToken':
+                case 'firebaseToken':
                     firebaseIdToken = message.token;
                     if (firebaseIdToken) {
                         extensionContext.secrets.store('firebaseIdToken', firebaseIdToken);
@@ -658,15 +726,14 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                     try {
 
                         codeViewPanel.webview.postMessage({ command: 'showLoading' });
-                        await reEmbedGraphNodes(); 
+                        await reEmbedGraphNodes();
                         await proposeCodeFromStory(message.text);
                     }
                     catch (error) {
                         // Step 4: If an error occurs, send an error message to the webview
                         let errorMessage = 'Failed to generate code: An unknown error occurred.';
-                        if (error instanceof Error)
-                        {
-                          errorMessage = `Failed to generate code: ${error.message}`;
+                        if (error instanceof Error) {
+                            errorMessage = `Failed to generate code: ${error.message}`;
                         }
                         console.error('[Extension] An error occurred during LLM generation.', error);
                         codeViewPanel.webview.postMessage({
@@ -674,10 +741,10 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                             text: errorMessage,
                         });
                     }
-                    finally{
+                    finally {
                         codeViewPanel.webview.postMessage({ command: 'hideLoading' });
                     }
-                    
+
                     break; // Use break, not return, if you have more cases after this
                 case 'applySelectedChanges':
                     const selectedChanges = message.changes as ProposedFileChange[];
@@ -689,7 +756,7 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                     break;
                 case 'showDiff':
                     const leftUri = vscode.Uri.file(path.join(vscode.workspace.rootPath || '', message.filePath));
-                    const rightDoc = await vscode.workspace.openTextDocument({ content: message.newContent, language:message.language });
+                    const rightDoc = await vscode.workspace.openTextDocument({ content: message.newContent, language: message.language });
                     const rightUri = rightDoc.uri;
                     vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `Preview Diff: ${message.filePath}`);
                     break;
@@ -708,7 +775,7 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
 function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     // Local path to main script run in the webview
     const scriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'main.js');
-    const markedScriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'marked.min.js'); 
+    const markedScriptPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'marked.min.js');
     const stylePathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'styles.css');
     const htmlPathOnDisk = vscode.Uri.joinPath(extensionUri, 'codeview', 'index.html'); // Path to the new HTML file
 
@@ -727,7 +794,7 @@ function getCodeViewContent(webview: vscode.Webview, extensionUri: vscode.Uri) {
     // Firebase SDK URIs
     const firebaseAppUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'firebase-app-compat.js'));
     const firebaseAuthUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'codeview', 'firebase-auth-compat.js'));
-    
+
     // Read the HTML content
     const htmlContent = fs.readFileSync(htmlPathOnDisk.fsPath, 'utf8');
 
@@ -838,7 +905,7 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
                     isNewFile: false
                 });
             }
-            
+
             // Start parsing the new file
             currentFilePath = trimmedLine.substring(startFileMarker.length).trim();
             // Remove the trailing ' ---' if it exists.
@@ -847,7 +914,7 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
             }
 
             currentContent = [];
-            parsingExplanation = false; 
+            parsingExplanation = false;
         } else if (trimmedLine.startsWith(endFileMarker)) {
             // End of a file marker. Save the content.
             if (currentFilePath !== null) {
@@ -893,7 +960,7 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
             }
         }
     }
-    
+
     return { fileChanges, explanation: explanationLines.join('\n').trim() };
 }
 
@@ -967,7 +1034,7 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
     if (success && codeViewPanel) {
         codeViewPanel.webview.postMessage({ command: 'changesApplied' });
         vscode.window.showInformationMessage('SaralFlow: Code changes applied successfully!');
-    }  
+    }
     else {
         vscode.window.showErrorMessage('SaralFlow: Failed to apply code changes.');
     }
