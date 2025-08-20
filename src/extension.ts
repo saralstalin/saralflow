@@ -26,7 +26,7 @@ export let firebaseIdToken: string | null = null;
 let firebaseTokenPromiseResolve: ((value: string) => void) | null = null;
 // Create a status bar item for SaralFlow
 const saralCodeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
-let graphSearch: GraphSearch | undefined;
+export let graphSearch = new GraphSearch(); // empty at start
 
 // Track which nodes came from which file so we can remove missing ones on rebuild
 const fileToNodeIds = new Map<string, Set<string>>(); // key: uri.toString()
