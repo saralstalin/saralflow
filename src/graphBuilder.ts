@@ -41,39 +41,6 @@ function isMaxContextError(e: unknown): boolean {
 }
 
 
-function buildEmbeddingPayload(node: INode, fullTextForFile: string, symbolNodesInFile: INode[]): string {
-  const header = `${node.kind}: ${node.label}\nURI: ${node.uri}\n`;
-
-  if (node.kind === 'File') {
-    // Build a compact "file summary": imports + top-level symbol names/kinds
-    const imports = (fullTextForFile.match(/^(?:\s*import\s.+|#include\s.+|from\s.+\simport\s.+)/gmi) || [])
-      .slice(0, 100)
-      .join('\n');
-
-    const topSymbols = symbolNodesInFile
-      .filter(s => s.uri === node.uri)
-      .slice(0, 200)
-      .map(s => `${s.kind}:${s.label}`)
-      .join('\n');
-
-    const body = [imports, '--- symbols ---', topSymbols].filter(Boolean).join('\n');
-    return safeSlice(header + body, MAX_FILE_EMBED_CHARS);
-  }
-
-  // For symbol nodes, prefer the symbol’s own snippet; if missing, fall back lightly
-  const snippet = node.codeSnippet ?? '';
-  let body = snippet;
-
-  // Long symbol bodies: keep head + tail to preserve signature & usage cues
-  if (body.length > MAX_SNIPPET_CHARS) {
-    const head = body.slice(0, Math.floor(MAX_SNIPPET_CHARS * 0.7));
-    const tail = body.slice(-Math.floor(MAX_SNIPPET_CHARS * 0.3));
-    body = `${head}\n…\n${tail}`;
-  }
-
-  return safeSlice(header + body, MAX_EMBED_CHARS);
-}
-
 function normalizePatterns(value: string | string[] | undefined, defaults: string[]): string[] {
   if (!value) { return defaults; }
   if (Array.isArray(value)) { return value; }
@@ -689,7 +656,11 @@ async function findCrossFileRelationshipsManually(
  * Processes a single file, adds the File node and symbol nodes + CONTAINS edges.
  * Also queues embeddings for symbol nodes (awaited at the very end of extractSemanticGraph).
  */
-async function processFileAndAddNodes(
+/** 
+ * Processes a single file, adds the File node and symbol nodes + CONTAINS edges.
+ * Also queues embeddings for symbol nodes (awaited at the very end of extractSemanticGraph).
+ */
+export async function processFileAndAddNodes(
   fileUri: vscode.Uri,
   graph: CodeGraph,
   documentCache: DocumentCache,
@@ -793,7 +764,7 @@ async function processFileAndAddNodes(
       const classRe = /^[ \t]*class[ \t]+([A-Za-z_][A-Za-z0-9_]*)/;
 
       lines.forEach((line, idx) => {
-        let match;
+        let match: RegExpExecArray | null;
         if ((match = defRe.exec(line))) {
           const name = match[1];
           const range = new vscode.Range(idx, 0, idx, line.length);
@@ -836,19 +807,44 @@ async function processFileAndAddNodes(
       symbolNodes.sort((a, b) => a.range!.start.line - b.range!.start.line)
     );
 
-    // Queue embeddings
+    // Queue embeddings for file + symbols
     const queueEmbeddings = (nodes: INode[]) => {
       for (const node of nodes) {
         if (!node.embedding || node.embedding.length === 0) {
           const p = embeddingLimit(async () => {
             try {
-              const payload = buildEmbeddingPayload(node, fullText, symbolNodes);
+              let text: string;
+
+              if (node.kind === 'File') {
+                // Compact file summary for file nodes
+                text = buildFileEmbeddingText({
+                  uri: node.uri || uriStr,
+                  fileName: path.basename(fileUri.fsPath),
+                  fullText,
+                  symbolNodesInFile: symbolNodes,
+                  maxChars: MAX_FILE_EMBED_CHARS
+                });
+              } else {
+                // Rich symbol embedding: add filePath/language and safe defaults
+                text = buildEmbeddingText({
+                  kind: node.kind,
+                  label: node.label,
+                  detail: node.detail,
+                  codeSnippet: node.codeSnippet ?? '',
+                  path: path.basename(fileUri.fsPath),
+                  language: guessLanguageFromUri(node.uri || uriStr),
+                  // signatureLine can be threaded in if you want:
+                  // signatureLine: firstNonEmptyLine(node.codeSnippet ?? '')
+                });
+              }
+
               try {
-                const emb = await getEmbeddingViaCloudFunction(payload, statToken);
+                const emb = await getEmbeddingViaCloudFunction(text, statToken);
                 node.embedding = Array.isArray(emb) ? emb : [];
               } catch (e) {
                 if (isMaxContextError(e)) {
-                  const shorter = safeSlice(payload, RETRY_EMBED_CHARS);
+                  // retry with a shorter payload derived from the same text
+                  const shorter = safeSlice(text, RETRY_EMBED_CHARS);
                   const emb2 = await getEmbeddingViaCloudFunction(shorter, statToken);
                   node.embedding = Array.isArray(emb2) ? emb2 : [];
                 } else {
@@ -871,14 +867,11 @@ async function processFileAndAddNodes(
   }
 }
 
-
-
-
-
 /**
  * Re-embed nodes in the graph that don't have embeddings (uses static key; no Firebase check).
  */
 export async function reEmbedGraphNodes() {
+
   const unembeddedNodes = Array.from(semanticGraph.nodes.values()).filter(
     n => !n.embedding && n.codeSnippet
   );
@@ -893,8 +886,16 @@ export async function reEmbedGraphNodes() {
   const results = await Promise.all(
     unembeddedNodes.map(n =>
       embeddingLimit(async () => {
-        const text = `${n.kind}: ${n.label}\n${n.detail || ''}\n${n.codeSnippet}`;
-        const truncated = text.length > 8000 ? text.substring(0, 8000) : text;
+        const text = buildEmbeddingText({
+          kind: n.kind,
+          label: n.label,
+          detail: n.detail,
+          codeSnippet: n.codeSnippet ?? "",
+        });
+
+        // Truncate from the END (code section) — metadata stays intact.
+        const truncated = text.length > MAX_EMBED_CHARS ? text.slice(0, MAX_EMBED_CHARS) : text;
+
         try {
           const e = await getEmbeddingViaCloudFunction(truncated, statToken);
           if (e) { n.embedding = e; }
@@ -911,4 +912,102 @@ export async function reEmbedGraphNodes() {
   console.log(
     `[SaralFlow Graph] Finished re-embedding. Successfully re-embedded ${successCount} nodes.`
   );
+}
+
+
+function splitIdentifiers(s: string): string[] {
+  // Split camelCase/PascalCase, snake_case, kebab-case, and dots
+  const raw = s
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')  // camel→space
+    .replace(/[_\-.]+/g, ' ')                 // snake/kebab/dots→space
+    .toLowerCase();
+  const toks = raw.split(/\s+/).filter(Boolean);
+  // keep unigrams + join bigrams for better match with NL phrases
+  const bigrams: string[] = [];
+  for (let i = 0; i < toks.length - 1; i++) { bigrams.push(`${toks[i]} ${toks[i + 1]}`); }
+  return Array.from(new Set([...toks, ...bigrams]));
+}
+
+function buildEmbeddingText(n: {
+  kind: string;            // e.g., "class" | "property" | "method"
+  label: string;           // e.g., "MotherName"
+  detail?: string;         // optional docstring/signature
+  codeSnippet: string;     // code block
+  path?: string;           // file path if you have it
+  language?: string;       // "csharp" | "typescript" | ...
+}): string {
+  const identifiers = Array.from(new Set([
+    n.label,
+    ...splitIdentifiers(n.label),
+    ...splitIdentifiers(n.codeSnippet.match(/[A-Za-z_][A-Za-z0-9_]*/g)?.join(' ') || '')
+  ]));
+  const actions = ['add', 'remove', 'delete', 'rename', 'update', 'deprecate', 'migrate'];
+
+  // Put the most useful stuff FIRST; CODE is last and can be truncated safely.
+  const header = [
+    `FILE: ${n.path || '(unknown)'}`,
+    `LANG: ${n.language || 'plain'}`,
+    `KIND: ${n.kind}`,
+    `LABEL: ${n.label}`,
+    `IDENTIFIERS: ${identifiers.slice(0, 50).join(', ')}`,   // cap to keep concise
+    `ACTIONS: ${actions.join(', ')}`
+  ].join('\n');
+
+  const detail = n.detail ? `\nDETAIL:\n${n.detail.trim()}` : '';
+
+  return `${header}${detail}\n\nCODE:\n${n.codeSnippet}`;
+}
+
+
+/**
+ * Build a compact file-level embedding payload:
+ * - LANGUAGE + imports/includes
+ * - top-level symbols (kind:name)
+ */
+function buildFileEmbeddingText(params: {
+  uri: string;
+  fileName: string;
+  fullText: string;
+  symbolNodesInFile: INode[];
+  maxChars: number;
+}): string {
+  const { uri, fileName, fullText, symbolNodesInFile, maxChars } = params;
+  const lang = guessLanguageFromUri(uri);
+
+  const imports = (fullText.match(
+    /^(?:\s*import\s.+|#include\s.+|from\s.+\simport\s.+)/gmi
+  ) || []).slice(0, 100).join('\n');
+
+  const topSymbols = symbolNodesInFile
+    .filter(s => s.uri === uri)
+    .slice(0, 200)
+    .map(s => `${s.kind}:${s.label}`)
+    .join('\n');
+
+  const header = `File: ${fileName}\nURI: ${uri}\nLANGUAGE: ${lang}\n`;
+  const body = [imports, '--- symbols ---', topSymbols]
+    .filter(Boolean)
+    .join('\n');
+
+  return safeSlice(header + body, maxChars);
+}
+
+
+function guessLanguageFromUri(uriStr: string): string {
+  const ext = (uriStr.split('.').pop() || '').toLowerCase();
+  const map: Record<string, string> = {
+    ts: 'TypeScript', tsx: 'TypeScript',
+    js: 'JavaScript', jsx: 'JavaScript',
+    cs: 'C#', java: 'Java',
+    py: 'Python', go: 'Go',
+    rs: 'Rust', php: 'PHP',
+    cpp: 'C++', c: 'C',
+    kt: 'Kotlin', swift: 'Swift',
+    rb: 'Ruby'
+  };
+  return map[ext] || ext;
+}
+
+function firstNonEmptyLine(s: string): string {
+  return (s || '').split(/\r?\n/).find(l => l.trim().length > 0) ?? '';
 }

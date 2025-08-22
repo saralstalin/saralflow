@@ -4,7 +4,7 @@ const appSection = document.getElementById('app-section');
 const emailInput = document.getElementById('emailInput');
 const passwordInput = document.getElementById('passwordInput');
 const loginButton = document.getElementById('loginButton');
-const registerButton = document.getElementById('registerButton'); 
+const registerButton = document.getElementById('registerButton');
 const authStatus = document.getElementById('authStatus');
 const confirmPasswordInput = document.getElementById('confirmPasswordInput');
 
@@ -39,13 +39,13 @@ if (resultDiv) {
 
 // --- Firebase Initialization ---
 const firebaseConfig = {
-  apiKey: "AIzaSyD-ufVjCUr7Ub_7arhrW5tqwfk9N_QPsfw",
-  authDomain: "saralflowapis.firebaseapp.com",
-  projectId: "saralflowapis",
-  storageBucket: "saralflowapis.firebasestorage.app",
-  messagingSenderId: "59243082833",
-  appId: "1:59243082833:web:821bafed4b8588b4c63470",
-  measurementId: "G-WK522LTEFX"
+    apiKey: "AIzaSyD-ufVjCUr7Ub_7arhrW5tqwfk9N_QPsfw",
+    authDomain: "saralflowapis.firebaseapp.com",
+    projectId: "saralflowapis",
+    storageBucket: "saralflowapis.firebasestorage.app",
+    messagingSenderId: "59243082833",
+    appId: "1:59243082833:web:821bafed4b8588b4c63470",
+    measurementId: "G-WK522LTEFX"
 };
 
 firebase.initializeApp(firebaseConfig);
@@ -78,7 +78,7 @@ auth.onIdTokenChanged(async (user) => {
             vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
 
             // Start periodic forced refresh (every 50 minutes)
-            if (tokenRefreshInterval) {clearInterval(tokenRefreshInterval);}
+            if (tokenRefreshInterval) { clearInterval(tokenRefreshInterval); }
             tokenRefreshInterval = setInterval(async () => {
                 try {
                     firebaseIdToken = await user.getIdToken(true);
@@ -96,7 +96,7 @@ auth.onIdTokenChanged(async (user) => {
         firebaseIdToken = null;
         updateUIForUser(null);
         authStatus.textContent = 'Please log in or register.';
-        if (tokenRefreshInterval) {clearInterval(tokenRefreshInterval);}
+        if (tokenRefreshInterval) { clearInterval(tokenRefreshInterval); }
     }
 });
 
@@ -289,12 +289,14 @@ window.addEventListener('message', async event => {
 });
 
 function escapeHtml(unsafe) {
-    return unsafe
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
+  if (unsafe === null) {return '';}
+  const s = String(unsafe);
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }
 
 function displayParsedResult(explanation, fileChanges) {

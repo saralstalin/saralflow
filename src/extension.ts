@@ -11,6 +11,7 @@ import { GraphSearch } from './graphSearch';
 const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeUrl')
     || 'https://us-central1-saralflowapis.cloudfunctions.net/generateCode';
 
+
 const DiffMatchPatch: any = require('diff-match-patch');
 
 export const suppressedWrites = new Set<string>();
@@ -89,6 +90,7 @@ interface GenerateCodeResponse {
     text?: string; // Content for successful code generation
     error?: string; // Error message if success is false
 }
+
 
 export function suppressPathOnce(absPath: string, ms = 1500) {
     suppressedWrites.add(absPath);
@@ -660,22 +662,56 @@ async function proposeCodeFromStory(userStory: string) {
 }
 
 function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
-    const topN = 5;
+    // Tunables
+    const MIN_KEEP = 2;     // always keep top-2
+    const MAX_KEEP = 7;     // never exceed this many total
+    const ALPHA = 0.86;     // dynamic threshold = ALPHA * bestScore
+    const ABS_MIN = 0.32;   // absolute floor in case bestScore is low
 
-    if (graphSearch) {
-        return graphSearch.search(storyEmbedding, topN).map(h => h.node);
+    // Helper to apply the "top-2 + thresholded rest" policy to a scored list
+    function selectWithThreshold(scored: Array<{ node: INode; s: number }>): INode[] {
+        if (scored.length === 0) { return []; }
+
+        scored.sort((a, b) => b.s - a.s);
+
+        // Always keep top-2 (or fewer if fewer available)
+        const picked: INode[] = scored.slice(0, Math.min(MIN_KEEP, scored.length)).map(x => x.node);
+
+        // Compute dynamic threshold from best score
+        const best = scored[0].s ?? 0;
+        const dynThresh = Math.max(ABS_MIN, best * ALPHA);
+
+        // From rank 3 onward, keep only "good" scores, up to MAX_KEEP
+        for (let i = MIN_KEEP; i < scored.length && picked.length < MAX_KEEP; i++) {
+            const { node, s } = scored[i];
+            if (s >= dynThresh) { picked.push(node); }
+            else { break; } // scores are sorted; once below threshold, we can stop
+        }
+
+        return picked;
     }
 
-    // Fallback (rare)
+    // Prefer graphSearch when available — fetch extra to allow filtering
+    if (graphSearch) {
+        const CANDIDATES = Math.max(MAX_KEEP * 2, 20); // get a buffer
+        const hits = graphSearch.search(storyEmbedding, CANDIDATES); // -> { node, score }
+        const scored = hits
+            .filter(h => !!h.node?.embedding) // safety
+            .map(h => ({ node: h.node, s: h.score ?? 0 }));
+        return selectWithThreshold(scored);
+    }
+
+    // Fallback (rare): manual cosine over all nodes
     if (!semanticGraph || semanticGraph.nodes.size === 0) { return []; }
-    const scored = [];
+
+    const scored: Array<{ node: INode; s: number }> = [];
     for (const node of semanticGraph.nodes.values()) {
         if (!node.embedding) { continue; }
         const s = cosineSimilarity(storyEmbedding, node.embedding);
         scored.push({ node, s });
     }
-    scored.sort((a, b) => b.s - a.s);
-    return scored.slice(0, topN).map(x => x.node);
+
+    return selectWithThreshold(scored);
 }
 
 function openSaralFlowWebview(extensionUri: vscode.Uri) {
