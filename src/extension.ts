@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { CodeGraph, INode } from './graphTypes';
+import { CodeGraph, INode, EdgeType } from './graphTypes';
 import { getEmbeddingViaCloudFunction, cosineSimilarity } from './embeddingService';
 import { extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, statToken, graphBuildInProgress, pendingFileChanges, getGraphGlobs } from './graphBuilder';
 const config = vscode.workspace.getConfiguration('saralflow');
@@ -662,56 +662,155 @@ async function proposeCodeFromStory(userStory: string) {
 }
 
 function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
-    // Tunables
-    const MIN_KEEP = 2;     // always keep top-2
-    const MAX_KEEP = 7;     // never exceed this many total
-    const ALPHA = 0.86;     // dynamic threshold = ALPHA * bestScore
-    const ABS_MIN = 0.32;   // absolute floor in case bestScore is low
+  // ---------- Tunables (seeds = similarity only) ----------
+  const MIN_KEEP = 2;        // always keep top-2 seeds
+  const MAX_KEEP = 7;        // total seeds to consider (upper bound before expansion)
+  const ALPHA = 0.86;        // dynamic threshold = ALPHA * bestScore
+  const ABS_MIN = 0.32;      // absolute score floor
 
-    // Helper to apply the "top-2 + thresholded rest" policy to a scored list
-    function selectWithThreshold(scored: Array<{ node: INode; s: number }>): INode[] {
-        if (scored.length === 0) { return []; }
+  // ---------- Expansion (graph-only) ----------
+  const EXPAND_DEPTH = 2;        // BFS depth from seeds
+  const EXPAND_DECAY = 0.85;     // per-step decay
+  const PER_SEED_LIMIT = 3;      // max neighbors to pull per seed
+  const RELATED_MAX = 8;         // cap on total related items returned (after seeds)
 
-        scored.sort((a, b) => b.s - a.s);
+  // Per-edge weights for expansion
+  const EDGE_W: Record<EdgeType, number> = {
+    [EdgeType.CALLS]: 1.0,
+    [EdgeType.CALLED_BY]: 1.0,
+    [EdgeType.REFERENCES]: 0.9,
+    [EdgeType.INHERITS_FROM]: 0.95,
+    [EdgeType.EXTENDS]: 0.95,
+    [EdgeType.IMPLEMENTS]: 0.95,
+    [EdgeType.IMPORTS]: 0.65,
+    [EdgeType.HAS_TYPE]: 0.7,
+    [EdgeType.DEFINES]: 0.5,
+    [EdgeType.CONTAINS]: 0.45,
+  } as any;
 
-        // Always keep top-2 (or fewer if fewer available)
-        const picked: INode[] = scored.slice(0, Math.min(MIN_KEEP, scored.length)).map(x => x.node);
+  // ---------- Helpers ----------
+  function selectSeeds(scored: Array<{ node: INode; s: number }>): INode[] {
+    if (scored.length === 0) {return [];}
+    scored.sort((a, b) => b.s - a.s);
 
-        // Compute dynamic threshold from best score
-        const best = scored[0].s ?? 0;
-        const dynThresh = Math.max(ABS_MIN, best * ALPHA);
+    // Keep top-2 no matter what
+    const seeds: INode[] = scored.slice(0, Math.min(MIN_KEEP, scored.length)).map(x => x.node);
 
-        // From rank 3 onward, keep only "good" scores, up to MAX_KEEP
-        for (let i = MIN_KEEP; i < scored.length && picked.length < MAX_KEEP; i++) {
-            const { node, s } = scored[i];
-            if (s >= dynThresh) { picked.push(node); }
-            else { break; } // scores are sorted; once below threshold, we can stop
+    // Dynamic threshold on the rest up to MAX_KEEP
+    const best = scored[0].s ?? 0;
+    const dynThresh = Math.max(ABS_MIN, best * ALPHA);
+    for (let i = MIN_KEEP; i < scored.length && seeds.length < MAX_KEEP; i++) {
+      const { node, s } = scored[i];
+      if (s >= dynThresh) {seeds.push(node);}
+      else {break;} // scores sorted
+    }
+    return seeds;
+  }
+
+  function getNeighbors(nodeId: string): Array<{ id: string; type: EdgeType }> {
+    const out: Array<{ id: string; type: EdgeType }> = [];
+    if (!semanticGraph) {return out;}
+    const edges = semanticGraph.edges || [];
+    for (const e of edges) {
+      if (e.from === nodeId && e.to) {out.push({ id: e.to, type: e.label as EdgeType });}
+      if (e.to === nodeId && e.from) {
+        // Provide reverse traversal for symmetry
+        const t = (e.label as EdgeType) === EdgeType.CALLS ? EdgeType.CALLED_BY :
+                  (e.label as EdgeType) === EdgeType.CALLED_BY ? EdgeType.CALLS :
+                  e.label as EdgeType;
+        out.push({ id: e.from, type: t });
+      }
+    }
+    return out;
+  }
+
+  function uniqueInOrder<T>(arr: T[], key: (x: T) => string): T[] {
+    const seen = new Set<string>();
+    const out: T[] = [];
+    for (const x of arr) {
+      const k = key(x);
+      if (!seen.has(k)) { seen.add(k); out.push(x); }
+    }
+    return out;
+  }
+
+  // ---------- Phase 1: Similarity-only seeds ----------
+  let scored: Array<{ node: INode; s: number }> = [];
+
+  if (graphSearch) {
+    const CANDIDATES = Math.max(MAX_KEEP * 4, 40);
+    const hits = graphSearch.search(storyEmbedding, CANDIDATES); // -> { node, score }
+    scored = hits
+      .filter(h => !!h.node?.embedding)
+      .map(h => ({ node: h.node, s: h.score ?? 0 }));
+  } else {
+    if (!semanticGraph || semanticGraph.nodes.size === 0) {return [];}
+    for (const node of semanticGraph.nodes.values()) {
+      if (!node.embedding) {continue;}
+      const s = cosineSimilarity(storyEmbedding, node.embedding);
+      scored.push({ node, s });
+    }
+  }
+
+  const seedNodes = selectSeeds(scored);
+  if (seedNodes.length === 0) {return [];}
+
+  // ---------- Phase 2: Graph-only expansion ----------
+  // BFS from each seed, score neighbors only by edge weights and decay. No similarity used here.
+  const seedIds = new Set(seedNodes.map(n => n.id));
+  const relatedScores = new Map<string, number>(); // nodeId -> score
+  const relatedBySeedCount = new Map<string, number>(); // per-seed quota
+
+  for (const seed of seedNodes) {
+    relatedBySeedCount.set(seed.id, 0);
+
+    // frontier: [nodeId, depth, strength]
+    const frontier: Array<{ id: string; depth: number; strength: number }> = [{ id: seed.id, depth: 0, strength: 1 }];
+
+    const visited = new Set<string>([seed.id]);
+
+    while (frontier.length) {
+      const cur = frontier.shift()!;
+      if (cur.depth >= EXPAND_DEPTH) {continue;}
+
+      const nbrs = getNeighbors(cur.id);
+      for (const nb of nbrs) {
+        if (visited.has(nb.id)) {continue;}
+        visited.add(nb.id);
+
+        // Compute contribution
+        const w = EDGE_W[nb.type] ?? 0.5;
+        const nextStrength = cur.strength * w * EXPAND_DECAY;
+
+        // Skip if extremely weak
+        if (nextStrength < 1e-4) {continue;}
+
+        // Do not count seeds as related
+        if (!seedIds.has(nb.id)) {
+          // Enforce per-seed cap
+          const used = relatedBySeedCount.get(seed.id)!;
+          if (used < PER_SEED_LIMIT) {
+            relatedScores.set(nb.id, (relatedScores.get(nb.id) || 0) + nextStrength);
+            relatedBySeedCount.set(seed.id, used + 1);
+          }
         }
 
-        return picked;
+        // Enqueue further traversal
+        frontier.push({ id: nb.id, depth: cur.depth + 1, strength: nextStrength });
+      }
     }
+  }
 
-    // Prefer graphSearch when available — fetch extra to allow filtering
-    if (graphSearch) {
-        const CANDIDATES = Math.max(MAX_KEEP * 2, 20); // get a buffer
-        const hits = graphSearch.search(storyEmbedding, CANDIDATES); // -> { node, score }
-        const scored = hits
-            .filter(h => !!h.node?.embedding) // safety
-            .map(h => ({ node: h.node, s: h.score ?? 0 }));
-        return selectWithThreshold(scored);
-    }
+  // Build related list from scores (highest first), ignoring seeds
+  const relatedSorted: INode[] = [...relatedScores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, RELATED_MAX)
+    .map(([id]) => semanticGraph?.nodes.get(id))
+    .filter(Boolean) as INode[];
 
-    // Fallback (rare): manual cosine over all nodes
-    if (!semanticGraph || semanticGraph.nodes.size === 0) { return []; }
-
-    const scored: Array<{ node: INode; s: number }> = [];
-    for (const node of semanticGraph.nodes.values()) {
-        if (!node.embedding) { continue; }
-        const s = cosineSimilarity(storyEmbedding, node.embedding);
-        scored.push({ node, s });
-    }
-
-    return selectWithThreshold(scored);
+  // ---------- Final: seeds first (most relevant), then related (graph neighbors) ----------
+  const ordered = uniqueInOrder<INode>([...seedNodes, ...relatedSorted], n => n.id);
+  return ordered;
 }
 
 function openSaralFlowWebview(extensionUri: vscode.Uri) {
