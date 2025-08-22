@@ -27,6 +27,136 @@ applyStatusMessage.style.color = 'var(--vscode-editor-foreground)';
 const userNameSpan = document.getElementById('userName');
 const logoutButton = document.getElementById('logoutButton');
 
+const progressDetails = document.createElement('details');
+progressDetails.id = 'progressBox';
+progressDetails.open = true; // expanded by default
+
+const summary = document.createElement('summary');
+summary.textContent = 'Progress';
+summary.style.cursor = 'pointer';
+summary.style.userSelect = 'none';
+summary.style.fontWeight = '600';
+summary.style.marginTop = '12px';
+
+// optional: a compact summary line we can update after completion
+const summaryStatus = document.createElement('span');
+summaryStatus.id = 'progressSummaryStatus';
+summaryStatus.style.opacity = '0.8';
+summaryStatus.style.marginLeft = '8px';
+summary.appendChild(summaryStatus);
+
+const progressContainer = document.createElement('div');
+progressContainer.id = 'progressContainer';
+progressContainer.style.marginTop = '8px';
+progressContainer.style.display = 'flex';
+progressContainer.style.alignItems = 'flex-start';
+progressContainer.style.gap = '24px';
+
+const stepsList = document.createElement('ol');
+stepsList.id = 'progressSteps';
+stepsList.style.listStyle = 'none';
+stepsList.style.padding = '0';
+stepsList.style.margin = '0';
+stepsList.style.minWidth = '220px';
+stepsList.style.flex = '0 0 auto';
+
+const liveLog = document.createElement('div');
+liveLog.id = 'liveLog';
+liveLog.style.fontSize = '12px';
+liveLog.style.maxHeight = '240px';
+liveLog.style.overflow = 'auto';
+liveLog.style.borderLeft = '2px solid var(--vscode-editor-foreground)';
+liveLog.style.paddingLeft = '8px';
+liveLog.style.flex = '1';
+liveLog.setAttribute('aria-live', 'polite');
+
+progressContainer.appendChild(stepsList);
+progressContainer.appendChild(liveLog);
+
+progressDetails.appendChild(summary);
+progressDetails.appendChild(progressContainer);
+
+// Attach under your loading message or wherever you want it to live
+if (loadingMessage && loadingMessage.parentElement) {
+    loadingMessage.parentElement.insertBefore(progressDetails, loadingMessage.nextSibling);
+}
+
+// ----- logic (same API as before, with summary helpers) -----
+const DEFAULT_STEPS = [
+    { id: 'understand', label: 'Understanding story', status: 'pending' },
+    { id: 'retrieve', label: 'Finding relevant code', status: 'pending' },
+    { id: 'plan', label: 'Planning changes', status: 'pending' },
+    { id: 'generate', label: 'Generating code', status: 'pending' },
+    { id: 'format', label: 'Formatting & imports', status: 'pending' },
+    { id: 'validate', label: 'Validating changes', status: 'pending' },
+    { id: 'preview', label: 'Preparing preview', status: 'pending' },
+];
+
+let currentSteps = [];
+
+function renderSteps() {
+    stepsList.innerHTML = '';
+    for (const s of currentSteps) {
+        const li = document.createElement('li');
+        li.id = `step-${s.id}`;
+        li.style.display = 'flex';
+        li.style.alignItems = 'center';
+        li.style.gap = '6px';
+        const icon = document.createElement('span');
+        icon.style.width = '16px';
+        icon.style.display = 'inline-block';
+        if (s.status === 'done') { icon.textContent = '✔'; }
+        else if (s.status === 'active') { icon.textContent = '⏳'; }
+        else if (s.status === 'error') { icon.textContent = '⚠'; }
+        else { icon.textContent = '•'; }
+        const text = document.createElement('span');
+        text.textContent = s.label;
+        li.appendChild(icon);
+        li.appendChild(text);
+        stepsList.appendChild(li);
+    }
+}
+
+function setStepStatus(id, status) {
+    const s = currentSteps.find(x => x.id === id);
+    if (!s) { return; }
+    s.status = status;
+    renderSteps();
+}
+
+function setProgressSummary(text) {
+    summaryStatus.textContent = text ? `— ${text}` : '';
+}
+
+function startProgress() {
+    progressDetails.open = true;        // expand on new run
+    setProgressSummary('running…');     // initial summary hint
+    currentSteps = DEFAULT_STEPS.map(x => ({ ...x }));
+    currentSteps[0].status = 'active';
+    renderSteps();
+    liveLog.innerHTML = '';
+}
+
+function completeAll(success = true) {
+    for (const s of currentSteps) {
+        if (s.status !== 'done') { s.status = (s.status === 'error' ? 'error' : 'done'); }
+    }
+    renderSteps();
+    setProgressSummary(success ? 'completed' : 'failed');
+}
+
+function collapseProgress() {
+    progressDetails.open = false;
+}
+
+function logEvent(msg) {
+    const p = document.createElement('div');
+    p.textContent = `• ${msg}`;
+    liveLog.appendChild(p);
+    liveLog.scrollTop = liveLog.scrollHeight;
+}
+
+
 let isRegisterMode = false;
 
 if (resultDiv) {
@@ -220,12 +350,16 @@ generateButton.addEventListener('click', async () => {
         vscode.postMessage({ command: 'showError', text: 'Failed to refresh authentication token. Please log in again.' });
         return;
     }
-    
+
     if (userStory) {
         resultDiv.innerHTML = '';
         loadingMessage.classList.remove('hidden');
         applySelectedButton.style.display = 'none';
         applyStatusMessage.style.display = 'none';
+        startProgress();
+        loadingMessage.classList.remove('hidden');
+        logEvent('Story submitted');
+        setStepStatus('understand', 'active');
         vscode.postMessage({ command: 'generateCode', text: userStory });
     }
 });
@@ -282,6 +416,56 @@ window.addEventListener('message', async event => {
             applyStatusMessage.style.color = 'green';
             applyStatusMessage.style.display = 'block';
             break;
+        case 'generationStart': {
+            startProgress();
+            loadingMessage.classList.remove('hidden');
+            break;
+        }
+        case 'generationStep': {
+            // payload: { id: 'retrieve'|'plan'|'generate'|'format'|'validate'|'preview', status?: 'active'|'done'|'error', note?: string }
+            const { id, status = 'active', note } = message;
+            setStepStatus(id, status);
+            if (note) { logEvent(note); }
+            // Automatically advance: mark previous active as done when a new one becomes active
+            if (status === 'active') {
+                for (const s of currentSteps) {
+                    if (s.id !== id && s.status === 'active') { s.status = 'done'; }
+                }
+                renderSteps();
+            }
+            break;
+        }
+        case 'fileReady': {
+            // payload: { fileChange: { filePath, content, isNewFile }, note?: string }
+            const { fileChange, note } = message;
+            if (note) { logEvent(note); }
+            setStepStatus('generate', 'done');
+            setStepStatus('format', 'active'); // your host can flip statuses too
+            // Show incremental preview: reuse existing renderer for one file
+            displayParsedResult('', [fileChange]); // keep explanation empty to avoid top block
+            setStepStatus('preview', 'active');
+            break;
+        }
+        case 'generationError': {
+            // payload: { id?: stepId, message: string }
+            const { id, message: errMsg } = message;
+            if (id) { setStepStatus(id, 'error'); }
+            logEvent(`Error: ${errMsg}`);
+            loadingMessage.classList.add('hidden');
+            break;
+        }
+        case 'generationDone': {
+            const { success = true, summary } = message;
+            if (summary) { setProgressSummary(summary); } // show brief outcome in the <summary>
+            completeAll(success);
+            loadingMessage.classList.add('hidden');
+            // Auto-collapse after a beat so users can focus on the results
+            setTimeout(() => collapseProgress(), 300);
+            if (resultDiv && resultDiv.innerText.trim().length > 0) {
+                applySelectedButton.style.display = 'block';
+            }
+            break;
+        }
         default:
             console.warn('Unknown command received:', message.command, message);
             break;
@@ -289,14 +473,14 @@ window.addEventListener('message', async event => {
 });
 
 function escapeHtml(unsafe) {
-  if (unsafe === null) {return '';}
-  const s = String(unsafe);
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+    if (unsafe === null) { return ''; }
+    const s = String(unsafe);
+    return s
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
 }
 
 function displayParsedResult(explanation, fileChanges) {
@@ -323,13 +507,13 @@ function displayParsedResult(explanation, fileChanges) {
             arrow.classList.add('arrow');
             arrow.textContent = '▶';
             header.appendChild(arrow);
-            
+
             const checkbox = document.createElement('input');
             checkbox.type = 'checkbox';
             checkbox.id = `checkbox-${index}`;
             checkbox.dataset.filePath = change.filePath;
             checkbox.checked = true;
-            
+
             const fileLabel = document.createElement('label');
             fileLabel.htmlFor = `checkbox-${index}`;
             fileLabel.textContent = ` ${change.filePath} (${change.isNewFile ? 'New File' : 'Edit'})`;
@@ -373,7 +557,7 @@ function displayParsedResult(explanation, fileChanges) {
                 header.classList.toggle('collapsed');
                 codeContent.classList.toggle('collapsed');
             });
-            
+
             if (languageClass) {
                 const codeElement = codeEditableDiv.querySelector('code');
                 if (codeElement && typeof Prism !== 'undefined') {

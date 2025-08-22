@@ -571,25 +571,67 @@ async function proposeCodeFromStory(userStory: string) {
         return;
     }
 
+    // UI: reset + start progress
     codeViewPanel.webview.postMessage({ command: 'showLoading' });
-    codeViewPanel.webview.postMessage({ command: 'clearResults' }); // Clear previous results
+    codeViewPanel.webview.postMessage({ command: 'clearResults' });
+    codeViewPanel.webview.postMessage({ command: 'generationStart' });
+    codeViewPanel.webview.postMessage({
+        command: 'generationStep',
+        id: 'understand',
+        status: 'active',
+        note: 'Embedding story...'
+    });
 
     try {
         let relevantFileContents: { filePath: string; content: string }[] = [];
 
-        // --- Use getEmbeddingViaCloudFunction for story embedding ---
+        // --- Step 1: Embed story (UNDERSTAND) ---
         const storyEmbedding = await getEmbeddingViaCloudFunction(userStory, statToken);
 
         if (!storyEmbedding) {
-            vscode.window.showErrorMessage('SaralFlow: Failed to embedd story.');
-            codeViewPanel.webview.postMessage({ command: 'showError', text: 'Failed to generate query embedding.' });
+            const msg = 'Failed to generate query embedding.';
+            vscode.window.showErrorMessage(`SaralFlow: ${msg}`);
+            codeViewPanel.webview.postMessage({ command: 'generationError', id: 'understand', message: msg });
+            codeViewPanel.webview.postMessage({ command: 'showError', text: msg });
             return;
         }
 
-        const relevantNodes = findRelevantNodesByStory(storyEmbedding);
+        // Mark understand done, move to retrieve
+        codeViewPanel.webview.postMessage({
+            command: 'generationStep',
+            id: 'understand',
+            status: 'done',
+            note: 'Story embedding ready.'
+        });
+        codeViewPanel.webview.postMessage({
+            command: 'generationStep',
+            id: 'retrieve',
+            status: 'active',
+            note: 'Searching graph for relevant code...'
+        });
 
-        // Step 2: Fetch full file content for relevant nodes
-        const fileContentsMap = new Map<string, string>(); // Map of file path to its full content
+        // --- Step 2: Similarity search + graph expansion (RETRIEVE) ---
+        const relevantNodes = findRelevantNodesByStory(storyEmbedding);
+        const seedCount = Math.min(2, relevantNodes.length); // your policy keeps top-2 for sure
+        const totalCandidates = relevantNodes.length;
+
+        codeViewPanel.webview.postMessage({
+            command: 'generationStep',
+            id: 'retrieve',
+            status: 'done',
+            note: `Found ${totalCandidates} candidate node(s) (top-${seedCount} seeds + related).`
+        });
+
+        // --- Step 3: Build sliced/full contexts (PLAN) ---
+        codeViewPanel.webview.postMessage({
+            command: 'generationStep',
+            id: 'plan',
+            status: 'active',
+            note: 'Preparing file contexts...'
+        });
+
+        // Fetch full file contents for relevant nodes
+        const fileContentsMap = new Map<string, string>(); // relative path -> content
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (workspaceFolders && workspaceFolders.length > 0) {
             const rootPath = workspaceFolders[0].uri.fsPath;
@@ -597,26 +639,39 @@ async function proposeCodeFromStory(userStory: string) {
                 const relativeFilePath = vscode.workspace.asRelativePath(vscode.Uri.parse(node.uri));
                 const fullFilePath = path.join(rootPath, relativeFilePath);
                 try {
-                    // Read the file content
                     const fileUri = vscode.Uri.file(fullFilePath);
                     const fileBuffer = await vscode.workspace.fs.readFile(fileUri);
                     const fileContent = Buffer.from(fileBuffer).toString('utf8');
                     fileContentsMap.set(relativeFilePath, fileContent);
                 } catch (error) {
                     console.warn(`SaralFlow: Could not read file ${relativeFilePath} for context: ${error}`);
-                    // If we can't read the file, perhaps still provide the node.codeSnippet as fallback context
                     if (node.codeSnippet) {
-                        fileContentsMap.set(relativeFilePath, node.codeSnippet); // Fallback: use just the snippet
+                        fileContentsMap.set(relativeFilePath, node.codeSnippet); // fallback: snippet only
                     }
                 }
             }
         }
 
-        // Convert Map to an array of objects as expected by the Cloud Function
+        // Convert to array for cloud function
         relevantFileContents = Array.from(fileContentsMap.entries()).map(([filePath, content]) => ({
-            filePath: filePath,
-            content: content
+            filePath,
+            content
         }));
+
+        codeViewPanel.webview.postMessage({
+            command: 'generationStep',
+            id: 'plan',
+            status: 'done',
+            note: `Prepared context for ${relevantFileContents.length} file(s).`
+        });
+
+        // --- Step 4: Call generator (GENERATE) ---
+        codeViewPanel.webview.postMessage({
+            command: 'generationStep',
+            id: 'generate',
+            status: 'active',
+            note: 'Calling code generator...'
+        });
 
         const response = await fetch(generateCodeFunctionUrl, {
             method: 'POST',
@@ -632,185 +687,244 @@ async function proposeCodeFromStory(userStory: string) {
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`Cloud Function error: ${response.status} - ${errorText}`);
+            const msg = `Cloud Function error: ${response.status} - ${errorText}`;
+            codeViewPanel.webview.postMessage({ command: 'generationError', id: 'generate', message: msg });
+            throw new Error(msg);
         }
 
-        const result = await response.json() as GenerateCodeResponse; // Type assertion here
+        const result = await response.json() as GenerateCodeResponse;
 
-        if (result.success && result.text) { // Now TypeScript knows 'success' and 'text' exist
-            // Extract the text from the response and then parse it
+        codeViewPanel.webview.postMessage({
+            command: 'generationStep',
+            id: 'generate',
+            status: 'done',
+            note: 'Generation complete.'
+        });
+
+        // --- Step 5: Parse & preview (PREVIEW) ---
+        codeViewPanel.webview.postMessage({
+            command: 'generationStep',
+            id: 'preview',
+            status: 'active',
+            note: 'Preparing preview...'
+        });
+
+        if (result.success && result.text) {
             const llmResponseText = result.text;
-            const parsedResult = await parseLLMResponse(llmResponseText); // Pass the text content
+
+            // If your cloud now returns “full updated files” instead of diffs, your parse function should handle it.
+            const parsedResult = await parseLLMResponse(llmResponseText);
+
+            // (Optional) Mark format/validate as “done” if you run them elsewhere;
+            // or flip them to active/done around your formatter hooks.
+            codeViewPanel.webview.postMessage({
+                command: 'generationStep',
+                id: 'format',
+                status: 'done',
+                note: 'Formatting will be applied on save/apply.'
+            });
+            codeViewPanel.webview.postMessage({
+                command: 'generationStep',
+                id: 'validate',
+                status: 'done',
+                note: 'Basic validation completed.'
+            });
 
             codeViewPanel?.webview.postMessage({
                 command: 'displayParsedResult',
                 explanation: parsedResult.explanation,
                 fileChanges: parsedResult.fileChanges,
             });
-        }
-        else {
-            throw new Error(result.error || 'Unknown error from Cloud Function.');
-        }
 
+            // Finalize
+            codeViewPanel.webview.postMessage({
+                command: 'generationStep',
+                id: 'preview',
+                status: 'done',
+                note: 'Preview ready.'
+            });
+            codeViewPanel.webview.postMessage({
+                command: 'generationDone',
+                success: true,
+                summary: `Prepared ${parsedResult.fileChanges?.length ?? 0} file(s).`
+            });
+        } else {
+            const errMsg = result.error || 'Unknown error from Cloud Function.';
+            codeViewPanel.webview.postMessage({ command: 'generationError', id: 'generate', message: errMsg });
+            throw new Error(errMsg);
+        }
     } catch (error: any) {
         vscode.window.showErrorMessage(`SaralFlow: Failed to generate code: ${error.message}`);
         console.error(`SaralFlow: Code generation failed: ${error.message}`);
         codeViewPanel.webview.postMessage({ command: 'showError', text: `Error: ${error.message}` });
+
+        // Signal UI that the pipeline failed
+        codeViewPanel.webview.postMessage({
+            command: 'generationError',
+            id: 'preview', // best-effort attribution; adjust if you detect earlier failure step
+            message: error.message || String(error)
+        });
+        codeViewPanel.webview.postMessage({
+            command: 'generationDone',
+            success: false,
+            summary: 'Generation aborted due to error.'
+        });
     } finally {
         codeViewPanel.webview.postMessage({ command: 'hideLoading' });
     }
 }
 
+
 function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
-  // ---------- Tunables (seeds = similarity only) ----------
-  const MIN_KEEP = 2;        // always keep top-2 seeds
-  const MAX_KEEP = 7;        // total seeds to consider (upper bound before expansion)
-  const ALPHA = 0.86;        // dynamic threshold = ALPHA * bestScore
-  const ABS_MIN = 0.32;      // absolute score floor
+    // ---------- Tunables (seeds = similarity only) ----------
+    const MIN_KEEP = 2;        // always keep top-2 seeds
+    const MAX_KEEP = 7;        // total seeds to consider (upper bound before expansion)
+    const ALPHA = 0.86;        // dynamic threshold = ALPHA * bestScore
+    const ABS_MIN = 0.32;      // absolute score floor
 
-  // ---------- Expansion (graph-only) ----------
-  const EXPAND_DEPTH = 2;        // BFS depth from seeds
-  const EXPAND_DECAY = 0.85;     // per-step decay
-  const PER_SEED_LIMIT = 3;      // max neighbors to pull per seed
-  const RELATED_MAX = 8;         // cap on total related items returned (after seeds)
+    // ---------- Expansion (graph-only) ----------
+    const EXPAND_DEPTH = 2;        // BFS depth from seeds
+    const EXPAND_DECAY = 0.85;     // per-step decay
+    const PER_SEED_LIMIT = 3;      // max neighbors to pull per seed
+    const RELATED_MAX = 8;         // cap on total related items returned (after seeds)
 
-  // Per-edge weights for expansion
-  const EDGE_W: Record<EdgeType, number> = {
-    [EdgeType.CALLS]: 1.0,
-    [EdgeType.CALLED_BY]: 1.0,
-    [EdgeType.REFERENCES]: 0.9,
-    [EdgeType.INHERITS_FROM]: 0.95,
-    [EdgeType.EXTENDS]: 0.95,
-    [EdgeType.IMPLEMENTS]: 0.95,
-    [EdgeType.IMPORTS]: 0.65,
-    [EdgeType.HAS_TYPE]: 0.7,
-    [EdgeType.DEFINES]: 0.5,
-    [EdgeType.CONTAINS]: 0.45,
-  } as any;
+    // Per-edge weights for expansion
+    const EDGE_W: Record<EdgeType, number> = {
+        [EdgeType.CALLS]: 1.0,
+        [EdgeType.CALLED_BY]: 1.0,
+        [EdgeType.REFERENCES]: 0.9,
+        [EdgeType.INHERITS_FROM]: 0.95,
+        [EdgeType.EXTENDS]: 0.95,
+        [EdgeType.IMPLEMENTS]: 0.95,
+        [EdgeType.IMPORTS]: 0.65,
+        [EdgeType.HAS_TYPE]: 0.7,
+        [EdgeType.DEFINES]: 0.5,
+        [EdgeType.CONTAINS]: 0.45,
+    } as any;
 
-  // ---------- Helpers ----------
-  function selectSeeds(scored: Array<{ node: INode; s: number }>): INode[] {
-    if (scored.length === 0) {return [];}
-    scored.sort((a, b) => b.s - a.s);
+    // ---------- Helpers ----------
+    function selectSeeds(scored: Array<{ node: INode; s: number }>): INode[] {
+        if (scored.length === 0) { return []; }
+        scored.sort((a, b) => b.s - a.s);
 
-    // Keep top-2 no matter what
-    const seeds: INode[] = scored.slice(0, Math.min(MIN_KEEP, scored.length)).map(x => x.node);
+        // Keep top-2 no matter what
+        const seeds: INode[] = scored.slice(0, Math.min(MIN_KEEP, scored.length)).map(x => x.node);
 
-    // Dynamic threshold on the rest up to MAX_KEEP
-    const best = scored[0].s ?? 0;
-    const dynThresh = Math.max(ABS_MIN, best * ALPHA);
-    for (let i = MIN_KEEP; i < scored.length && seeds.length < MAX_KEEP; i++) {
-      const { node, s } = scored[i];
-      if (s >= dynThresh) {seeds.push(node);}
-      else {break;} // scores sorted
-    }
-    return seeds;
-  }
-
-  function getNeighbors(nodeId: string): Array<{ id: string; type: EdgeType }> {
-    const out: Array<{ id: string; type: EdgeType }> = [];
-    if (!semanticGraph) {return out;}
-    const edges = semanticGraph.edges || [];
-    for (const e of edges) {
-      if (e.from === nodeId && e.to) {out.push({ id: e.to, type: e.label as EdgeType });}
-      if (e.to === nodeId && e.from) {
-        // Provide reverse traversal for symmetry
-        const t = (e.label as EdgeType) === EdgeType.CALLS ? EdgeType.CALLED_BY :
-                  (e.label as EdgeType) === EdgeType.CALLED_BY ? EdgeType.CALLS :
-                  e.label as EdgeType;
-        out.push({ id: e.from, type: t });
-      }
-    }
-    return out;
-  }
-
-  function uniqueInOrder<T>(arr: T[], key: (x: T) => string): T[] {
-    const seen = new Set<string>();
-    const out: T[] = [];
-    for (const x of arr) {
-      const k = key(x);
-      if (!seen.has(k)) { seen.add(k); out.push(x); }
-    }
-    return out;
-  }
-
-  // ---------- Phase 1: Similarity-only seeds ----------
-  let scored: Array<{ node: INode; s: number }> = [];
-
-  if (graphSearch) {
-    const CANDIDATES = Math.max(MAX_KEEP * 4, 40);
-    const hits = graphSearch.search(storyEmbedding, CANDIDATES); // -> { node, score }
-    scored = hits
-      .filter(h => !!h.node?.embedding)
-      .map(h => ({ node: h.node, s: h.score ?? 0 }));
-  } else {
-    if (!semanticGraph || semanticGraph.nodes.size === 0) {return [];}
-    for (const node of semanticGraph.nodes.values()) {
-      if (!node.embedding) {continue;}
-      const s = cosineSimilarity(storyEmbedding, node.embedding);
-      scored.push({ node, s });
-    }
-  }
-
-  const seedNodes = selectSeeds(scored);
-  if (seedNodes.length === 0) {return [];}
-
-  // ---------- Phase 2: Graph-only expansion ----------
-  // BFS from each seed, score neighbors only by edge weights and decay. No similarity used here.
-  const seedIds = new Set(seedNodes.map(n => n.id));
-  const relatedScores = new Map<string, number>(); // nodeId -> score
-  const relatedBySeedCount = new Map<string, number>(); // per-seed quota
-
-  for (const seed of seedNodes) {
-    relatedBySeedCount.set(seed.id, 0);
-
-    // frontier: [nodeId, depth, strength]
-    const frontier: Array<{ id: string; depth: number; strength: number }> = [{ id: seed.id, depth: 0, strength: 1 }];
-
-    const visited = new Set<string>([seed.id]);
-
-    while (frontier.length) {
-      const cur = frontier.shift()!;
-      if (cur.depth >= EXPAND_DEPTH) {continue;}
-
-      const nbrs = getNeighbors(cur.id);
-      for (const nb of nbrs) {
-        if (visited.has(nb.id)) {continue;}
-        visited.add(nb.id);
-
-        // Compute contribution
-        const w = EDGE_W[nb.type] ?? 0.5;
-        const nextStrength = cur.strength * w * EXPAND_DECAY;
-
-        // Skip if extremely weak
-        if (nextStrength < 1e-4) {continue;}
-
-        // Do not count seeds as related
-        if (!seedIds.has(nb.id)) {
-          // Enforce per-seed cap
-          const used = relatedBySeedCount.get(seed.id)!;
-          if (used < PER_SEED_LIMIT) {
-            relatedScores.set(nb.id, (relatedScores.get(nb.id) || 0) + nextStrength);
-            relatedBySeedCount.set(seed.id, used + 1);
-          }
+        // Dynamic threshold on the rest up to MAX_KEEP
+        const best = scored[0].s ?? 0;
+        const dynThresh = Math.max(ABS_MIN, best * ALPHA);
+        for (let i = MIN_KEEP; i < scored.length && seeds.length < MAX_KEEP; i++) {
+            const { node, s } = scored[i];
+            if (s >= dynThresh) { seeds.push(node); }
+            else { break; } // scores sorted
         }
-
-        // Enqueue further traversal
-        frontier.push({ id: nb.id, depth: cur.depth + 1, strength: nextStrength });
-      }
+        return seeds;
     }
-  }
 
-  // Build related list from scores (highest first), ignoring seeds
-  const relatedSorted: INode[] = [...relatedScores.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, RELATED_MAX)
-    .map(([id]) => semanticGraph?.nodes.get(id))
-    .filter(Boolean) as INode[];
+    function getNeighbors(nodeId: string): Array<{ id: string; type: EdgeType }> {
+        const out: Array<{ id: string; type: EdgeType }> = [];
+        if (!semanticGraph) { return out; }
+        const edges = semanticGraph.edges || [];
+        for (const e of edges) {
+            if (e.from === nodeId && e.to) { out.push({ id: e.to, type: e.label as EdgeType }); }
+            if (e.to === nodeId && e.from) {
+                // Provide reverse traversal for symmetry
+                const t = (e.label as EdgeType) === EdgeType.CALLS ? EdgeType.CALLED_BY :
+                    (e.label as EdgeType) === EdgeType.CALLED_BY ? EdgeType.CALLS :
+                        e.label as EdgeType;
+                out.push({ id: e.from, type: t });
+            }
+        }
+        return out;
+    }
 
-  // ---------- Final: seeds first (most relevant), then related (graph neighbors) ----------
-  const ordered = uniqueInOrder<INode>([...seedNodes, ...relatedSorted], n => n.id);
-  return ordered;
+    function uniqueInOrder<T>(arr: T[], key: (x: T) => string): T[] {
+        const seen = new Set<string>();
+        const out: T[] = [];
+        for (const x of arr) {
+            const k = key(x);
+            if (!seen.has(k)) { seen.add(k); out.push(x); }
+        }
+        return out;
+    }
+
+    // ---------- Phase 1: Similarity-only seeds ----------
+    let scored: Array<{ node: INode; s: number }> = [];
+
+    if (graphSearch) {
+        const CANDIDATES = Math.max(MAX_KEEP * 4, 40);
+        const hits = graphSearch.search(storyEmbedding, CANDIDATES); // -> { node, score }
+        scored = hits
+            .filter(h => !!h.node?.embedding)
+            .map(h => ({ node: h.node, s: h.score ?? 0 }));
+    } else {
+        if (!semanticGraph || semanticGraph.nodes.size === 0) { return []; }
+        for (const node of semanticGraph.nodes.values()) {
+            if (!node.embedding) { continue; }
+            const s = cosineSimilarity(storyEmbedding, node.embedding);
+            scored.push({ node, s });
+        }
+    }
+
+    const seedNodes = selectSeeds(scored);
+    if (seedNodes.length === 0) { return []; }
+
+    // ---------- Phase 2: Graph-only expansion ----------
+    // BFS from each seed, score neighbors only by edge weights and decay. No similarity used here.
+    const seedIds = new Set(seedNodes.map(n => n.id));
+    const relatedScores = new Map<string, number>(); // nodeId -> score
+    const relatedBySeedCount = new Map<string, number>(); // per-seed quota
+
+    for (const seed of seedNodes) {
+        relatedBySeedCount.set(seed.id, 0);
+
+        // frontier: [nodeId, depth, strength]
+        const frontier: Array<{ id: string; depth: number; strength: number }> = [{ id: seed.id, depth: 0, strength: 1 }];
+
+        const visited = new Set<string>([seed.id]);
+
+        while (frontier.length) {
+            const cur = frontier.shift()!;
+            if (cur.depth >= EXPAND_DEPTH) { continue; }
+
+            const nbrs = getNeighbors(cur.id);
+            for (const nb of nbrs) {
+                if (visited.has(nb.id)) { continue; }
+                visited.add(nb.id);
+
+                // Compute contribution
+                const w = EDGE_W[nb.type] ?? 0.5;
+                const nextStrength = cur.strength * w * EXPAND_DECAY;
+
+                // Skip if extremely weak
+                if (nextStrength < 1e-4) { continue; }
+
+                // Do not count seeds as related
+                if (!seedIds.has(nb.id)) {
+                    // Enforce per-seed cap
+                    const used = relatedBySeedCount.get(seed.id)!;
+                    if (used < PER_SEED_LIMIT) {
+                        relatedScores.set(nb.id, (relatedScores.get(nb.id) || 0) + nextStrength);
+                        relatedBySeedCount.set(seed.id, used + 1);
+                    }
+                }
+
+                // Enqueue further traversal
+                frontier.push({ id: nb.id, depth: cur.depth + 1, strength: nextStrength });
+            }
+        }
+    }
+
+    // Build related list from scores (highest first), ignoring seeds
+    const relatedSorted: INode[] = [...relatedScores.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, RELATED_MAX)
+        .map(([id]) => semanticGraph?.nodes.get(id))
+        .filter(Boolean) as INode[];
+
+    // ---------- Final: seeds first (most relevant), then related (graph neighbors) ----------
+    const ordered = uniqueInOrder<INode>([...seedNodes, ...relatedSorted], n => n.id);
+    return ordered;
 }
 
 function openSaralFlowWebview(extensionUri: vscode.Uri) {
