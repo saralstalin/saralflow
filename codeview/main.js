@@ -182,7 +182,6 @@ firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const provider = new firebase.auth.GoogleAuthProvider();
 
-let firebaseIdToken = null;
 let tokenRefreshInterval = null; // For forced refresh
 
 // --- Unified auth state & token change handler ---
@@ -202,33 +201,40 @@ function updateUIForUser(user) {
 auth.onIdTokenChanged(async (user) => {
     if (user) {
         try {
-            firebaseIdToken = await user.getIdToken();
-            console.log("Updated Firebase ID Token:", firebaseIdToken);
-            updateUIForUser(user);
-            vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
+            // Current ID token
+            const idToken = await user.getIdToken(/* forceRefresh */ false);
+            // Expiration time (ISO string like "2025-08-23T12:34:56.000Z")
+            const tokenInfo = await user.getIdTokenResult();
+            const expiresAt = tokenInfo.expirationTime;
+            // Refresh token (secret) lives on the compat user object
+            const refreshToken = user.refreshToken;
 
-            // Start periodic forced refresh (every 50 minutes)
-            if (tokenRefreshInterval) { clearInterval(tokenRefreshInterval); }
-            tokenRefreshInterval = setInterval(async () => {
-                try {
-                    firebaseIdToken = await user.getIdToken(true);
-                    console.log("Forced token refresh successful:", firebaseIdToken);
-                    vscode.postMessage({ command: 'firebaseToken', token: firebaseIdToken });
-                } catch (err) {
-                    console.error("Forced token refresh failed:", err);
-                }
-            }, 50 * 60 * 1000); // 50 minutes
+            updateUIForUser(user);
+
+            // Send all three to extension so it can refresh tokens even when webview is closed
+            vscode.postMessage({
+                command: 'firebaseToken',
+                token: idToken,
+                refreshToken,     // <-- extension stores in SecretStorage
+                expiresAt         // <-- extension converts to epoch and refreshes before expiry
+            });
+
+            // Optional: reduce noisy logs / avoid printing whole tokens
+            console.log('Firebase token updated; expires at:', expiresAt);
 
         } catch (err) {
-            console.error("Error getting Firebase token:", err);
+            console.error('Error getting Firebase token:', err);
         }
     } else {
-        firebaseIdToken = null;
+        // Signed out
+        if (tokenRefreshInterval) { clearInterval(tokenRefreshInterval); }
         updateUIForUser(null);
         authStatus.textContent = 'Please log in or register.';
-        if (tokenRefreshInterval) { clearInterval(tokenRefreshInterval); }
+        // Tell the extension to clear stored secrets
+        vscode.postMessage({ command: 'firebaseSignOut' });
     }
 });
+
 
 // --- Login Button Click ---
 loginButton.addEventListener('click', async () => {
@@ -337,31 +343,24 @@ applySelectedButton.addEventListener('click', () => {
 });
 
 generateButton.addEventListener('click', async () => {
-    const userStory = userStoryTextArea.value;
-
-    if (!firebaseIdToken) {
-        vscode.postMessage({ command: 'showError', text: 'Please log in to Firebase first.' });
+    const userStory = userStoryTextArea.value.trim();
+    if (!auth.currentUser) {
+        vscode.postMessage({ command: 'showError', text: 'Please log in first' });
         return;
     }
-
-    try {
-        firebaseIdToken = await auth.currentUser.getIdToken(true);
-    } catch (err) {
-        vscode.postMessage({ command: 'showError', text: 'Failed to refresh authentication token. Please log in again.' });
+    if (!userStory) {
+        vscode.postMessage({ command: 'showError', text: 'Please enter a user story.' });
         return;
     }
+    resultDiv.innerHTML = '';
+    loadingMessage.classList.remove('hidden');
+    applySelectedButton.style.display = 'none';
+    applyStatusMessage.style.display = 'none';
+    startProgress();
+    logEvent('Story submitted');
+    setStepStatus('understand', 'active');
+    vscode.postMessage({ command: 'generateCode', text: userStory });
 
-    if (userStory) {
-        resultDiv.innerHTML = '';
-        loadingMessage.classList.remove('hidden');
-        applySelectedButton.style.display = 'none';
-        applyStatusMessage.style.display = 'none';
-        startProgress();
-        loadingMessage.classList.remove('hidden');
-        logEvent('Story submitted');
-        setStepStatus('understand', 'active');
-        vscode.postMessage({ command: 'generateCode', text: userStory });
-    }
 });
 
 function getLanguageFromPath(filePath) {

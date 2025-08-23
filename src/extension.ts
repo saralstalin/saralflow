@@ -7,6 +7,7 @@ import { extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, stat
 const config = vscode.workspace.getConfiguration('saralflow');
 import { minimatch } from "minimatch";
 import { GraphSearch } from './graphSearch';
+import { FirebaseAuthManager } from "./firebaseAuthManager";
 
 const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeUrl')
     || 'https://us-central1-saralflowapis.cloudfunctions.net/generateCode';
@@ -22,8 +23,7 @@ let extensionContext: vscode.ExtensionContext;
 // Global variable to store the built graph
 export let semanticGraph: CodeGraph = new CodeGraph();
 let isGraphBuilding = false;
-// Global variable to store the Firebase ID Token received from the webview
-export let firebaseIdToken: string | null = null;
+
 let firebaseTokenPromiseResolve: ((value: string) => void) | null = null;
 // Create a status bar item for SaralFlow
 const saralCodeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
@@ -31,6 +31,10 @@ export let graphSearch = new GraphSearch(); // empty at start
 
 // Track which nodes came from which file so we can remove missing ones on rebuild
 const fileToNodeIds = new Map<string, Set<string>>(); // key: uri.toString()
+
+const FIREBASE_WEB_API_KEY = "AIzaSyD-ufVjCUr7Ub_7arhrW5tqwfk9N_QPsfw";
+let authMgr: FirebaseAuthManager;
+
 
 function getNodesForUri(uriStr: string): INode[] {
     // semanticGraph.nodes is a Map<string, INode>
@@ -115,23 +119,20 @@ function shouldIgnoreEvent(uri: vscode.Uri): boolean {
     return false;
 }
 
-export function activate(vsContext: vscode.ExtensionContext) {
+export async function activate(vsContext: vscode.ExtensionContext) {
     extensionContext = vsContext;
 
-    // Check for a previously saved Firebase token immediately on startup
-    const checkTokenOnStartup = async () => {
-        const storedToken = await extensionContext.secrets.get('firebaseIdToken');
-        if (storedToken) {
-            firebaseIdToken = storedToken;
-            if (firebaseTokenPromiseResolve) {
-                firebaseTokenPromiseResolve(firebaseIdToken);
-            }
-            console.log('SaralFlow: Found a stored Firebase token on startup.');
-        } else {
-            console.log('SaralFlow: No stored Firebase token found.');
-        }
-    };
-    checkTokenOnStartup();
+    authMgr = new FirebaseAuthManager(FIREBASE_WEB_API_KEY, vsContext.secrets);
+    await authMgr.loadFromSecrets();
+   
+
+    try {
+        await authMgr.ensureSignedIn();
+    } catch {
+        vscode.window.showWarningMessage(
+            'SaralFlow: You are signed out. Please log in via the SaralFlow webview or the "SaralFlow: Sign In" command.'
+        );
+    }
 
 
     saralCodeStatusBarItem.text = `$(robot) Saralflow`;
@@ -432,11 +433,7 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
     const relevantNodes: INode[] = [];
     const queue: { nodeId: string, depth: number }[] = [];
 
-    // --- Get embedding for the query text using the Cloud Function ---
-    /*if (!firebaseIdToken) {
-        vscode.window.showErrorMessage('SaralFlow: Firebase login required to query semantic graph (missing ID token).');
-        return [];
-    }*/
+    
     const queryEmbedding = await getEmbeddingViaCloudFunction(queryText, statToken);
 
     if (!queryEmbedding) {
@@ -564,12 +561,7 @@ async function proposeCodeFromStory(userStory: string) {
         return;
     }
 
-    // Ensure Firebase ID token is available
-    if (!firebaseIdToken) {
-        vscode.window.showErrorMessage('Please log in first.');
-        codeViewPanel?.webview.postMessage({ command: 'showError', text: 'Please log in first.' });
-        return;
-    }
+    const idToken = await authMgr.getIdToken();
 
     // UI: reset + start progress
     codeViewPanel.webview.postMessage({ command: 'showLoading' });
@@ -677,7 +669,7 @@ async function proposeCodeFromStory(userStory: string) {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${firebaseIdToken}`
+                'Authorization': `Bearer ${idToken}`
             },
             body: JSON.stringify({
                 userStory: userStory,
@@ -955,31 +947,45 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                 return; // Exit the function gracefully
             }
             switch (message.command) {
-                case 'firebaseToken':
-                    firebaseIdToken = message.token;
-                    if (firebaseIdToken) {
-                        extensionContext.secrets.store('firebaseIdToken', firebaseIdToken);
-                        if (firebaseTokenPromiseResolve) {
-                            firebaseTokenPromiseResolve(firebaseIdToken);
+                case 'firebaseToken': {
+                    const idToken = message.token as string | undefined;
+                    const refreshToken = message.refreshToken as string | undefined;
+                    const expiresAt = message.expiresAt as string | undefined;
+
+                    if (idToken && refreshToken) {
+                        // Bootstrap into your AuthManager so tokens can be refreshed later
+                        await authMgr.bootstrapFromWebview(idToken, refreshToken, expiresAt);
+
+
+                        // Store in SecretStorage so you survive reloads
+                        await extensionContext.secrets.store('firebaseIdToken', idToken);
+                        await extensionContext.secrets.store('firebaseRefreshToken', refreshToken);
+                        if (expiresAt) {
+                            await extensionContext.secrets.store('firebaseIdTokenExpiresAt', expiresAt);
                         }
+
+                        if (firebaseTokenPromiseResolve) {
+                            firebaseTokenPromiseResolve(idToken);
+                        }
+
+                        console.log('[Extension] Firebase tokens received and stored.');
+                        await reEmbedGraphNodes();
                     } else {
-                        extensionContext.secrets.delete('firebaseIdToken');
+                        // Missing or invalid token → clear secrets
+                        await extensionContext.secrets.delete('firebaseIdToken');
+                        await extensionContext.secrets.delete('firebaseRefreshToken');
+                        await extensionContext.secrets.delete('firebaseIdTokenExpiresAt');
+                        console.warn('[Extension] firebaseToken message had no token/refreshToken; cleared.');
                     }
-                    console.log('Firebase ID Token received by extension.');
-                    await reEmbedGraphNodes();
                     break;
+                }
 
                 case 'generateCode':
-                    // We need to ensure proposeCodeFromStory also handles codeViewPanel potentially being undefined
-                    // if this callback gets invoked after the panel has been disposed.
                     try {
-
                         codeViewPanel.webview.postMessage({ command: 'showLoading' });
                         await reEmbedGraphNodes();
                         await proposeCodeFromStory(message.text);
-                    }
-                    catch (error) {
-                        // Step 4: If an error occurs, send an error message to the webview
+                    } catch (error) {
                         let errorMessage = 'Failed to generate code: An unknown error occurred.';
                         if (error instanceof Error) {
                             errorMessage = `Failed to generate code: ${error.message}`;
@@ -989,13 +995,12 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                             command: 'showError',
                             text: errorMessage,
                         });
-                    }
-                    finally {
+                    } finally {
                         codeViewPanel.webview.postMessage({ command: 'hideLoading' });
                     }
+                    break;
 
-                    break; // Use break, not return, if you have more cases after this
-                case 'applySelectedChanges':
+                case 'applySelectedChanges': {
                     const selectedChanges = message.changes as ProposedFileChange[];
                     if (selectedChanges && selectedChanges.length > 0) {
                         await applyCodeChanges(selectedChanges);
@@ -1003,16 +1008,22 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                         vscode.window.showWarningMessage('No selected changes to apply.');
                     }
                     break;
-                case 'showDiff':
+                }
+
+                case 'showDiff': {
                     const leftUri = vscode.Uri.file(path.join(vscode.workspace.rootPath || '', message.filePath));
-                    const rightDoc = await vscode.workspace.openTextDocument({ content: message.newContent, language: message.language });
+                    const rightDoc = await vscode.workspace.openTextDocument({
+                        content: message.newContent,
+                        language: message.language
+                    });
                     const rightUri = rightDoc.uri;
                     vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `Preview Diff: ${message.filePath}`);
                     break;
+                }
             }
         },
-        undefined, // This 'thisArg' is optional
-        extensionContext.subscriptions // Crucial for clean up
+        undefined, // thisArg
+        extensionContext.subscriptions
     );
 
     // Set up cleanup when the panel is closed by the user
