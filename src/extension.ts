@@ -11,9 +11,18 @@ import { FirebaseAuthManager } from "./firebaseAuthManager";
 
 const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeUrl')
     || 'https://us-central1-saralflowapis.cloudfunctions.net/generateCode';
-
+const generateSuggestionsUrl = config.get<string>("cloudFunctions.suggestUrl")
+    || "https://us-central1-saralflowapis.cloudfunctions.net/getSuggestions";
 
 const DiffMatchPatch: any = require('diff-match-patch');
+
+const ENABLE_INLINE = config.get<boolean>("inlineEnabled") ?? true;
+const MAX_PREFIX_CHARS = config.get<number>("maxPrefixChars") ?? 4000;
+const MAX_SUFFIX_CHARS = config.get<number>("maxSuffixChars") ?? 2000;
+
+// --- Tiny cache to avoid duplicate calls while cursor sits still ------------
+let lastKey: string | null = null;
+let lastResult: vscode.InlineCompletionList | null = null;
 
 export const suppressedWrites = new Set<string>();
 // Declare panel globally so it can be reused or disposed
@@ -124,7 +133,7 @@ export async function activate(vsContext: vscode.ExtensionContext) {
 
     authMgr = new FirebaseAuthManager(FIREBASE_WEB_API_KEY, vsContext.secrets);
     await authMgr.loadFromSecrets();
-   
+
 
     try {
         await authMgr.ensureSignedIn();
@@ -176,9 +185,9 @@ export async function activate(vsContext: vscode.ExtensionContext) {
         }
     });
     extensionContext.subscriptions.push(buildGraphDisposable);
-
     // Call the graph building command immediately after activation
     vscode.commands.executeCommand('SaralFlow.buildGraphOnStartup');
+
     // *** End Initial Graph Building ***
 
     // Command to show the built graph in the webview
@@ -391,8 +400,263 @@ export async function activate(vsContext: vscode.ExtensionContext) {
         await removeFileNodesFromGraph(uri);        // your existing graph mutation
         removeFileFromIndex(uri.toString());        // ✅ keep cosine index in sync
     });
+
+    const inlineProvider: vscode.InlineCompletionItemProvider = {
+        async provideInlineCompletionItems(document, position, context, token) {
+            try {
+                if (!ENABLE_INLINE) {
+                    return { items: [] };
+                }
+
+                // Must be signed in; fail silent if not.
+                let idToken: string;
+                try {
+                    idToken = await authMgr.getIdToken();
+                } catch {
+                    return { items: [] };
+                }
+
+                const fullText = document.getText();
+                const offset = document.offsetAt(position);
+
+                const prefixStart = Math.max(0, offset - MAX_PREFIX_CHARS);
+                const suffixEnd = Math.min(fullText.length, offset + MAX_SUFFIX_CHARS);
+
+                const prefix = fullText.slice(prefixStart, offset);
+                const suffix = fullText.slice(offset, suffixEnd);
+
+                const filePath = document.uri.fsPath;
+                const languageId = document.languageId;
+
+                // Cache key
+                const key = `${filePath}:${position.line}:${position.character}:${hash(prefix)}:${hash(suffix)}`;
+                if (key === lastKey && lastResult) {
+                    return lastResult;
+                }
+
+                const suggestions = await fetchSuggestions({
+                    url: generateSuggestionsUrl,
+                    idToken,
+                    payload: {
+                        filePath,
+                        languageId,
+                        prefix,
+                        suffix,
+                        line: position.line,
+                        character: position.character,
+                        n: 1,               // inline: 1 is best for latency; add cycling if you want >1
+                        temperature: 0.2
+                    },
+                    token
+                });
+
+                const items: vscode.InlineCompletionItem[] = [];
+                for (const s of suggestions || []) {
+                    const rawText = s.text ?? "";
+                    const { text, range } = sanitizeInlineSuggestion(rawText, document, position);
+                    if (text.length === 0) {
+                        continue;
+                    }
+                    const item = new vscode.InlineCompletionItem(text, range);
+                    if (s.filterText) {
+                        item.filterText = s.filterText;
+                    }
+                    items.push(item);
+                    // For inline we typically return 1; break if you want only the best suggestion.
+                    break;
+                }
+
+                const result: vscode.InlineCompletionList = { items };
+                lastKey = key;
+                lastResult = result;
+                return result;
+
+            } catch (_err) {
+                // Silent failures keep typing smooth
+                return { items: [] };
+            }
+        }
+    };
+
+    // Register for all languages; you can scope by id later
+    const inlineDisposable = vscode.languages.registerInlineCompletionItemProvider(
+        { scheme: "file", language: "*" },
+        inlineProvider
+    );
+    extensionContext.subscriptions.push(inlineDisposable);
+
+    const completionProvider = vscode.languages.registerCompletionItemProvider(
+        { scheme: "file", language: "*" },
+        {
+            async provideCompletionItems(document, position, _token, _ctx) {
+                try {
+                    const idToken = await authMgr.getIdToken();
+                    const fullText = document.getText();
+                    const offset = document.offsetAt(position);
+                    const prefix = fullText.slice(Math.max(0, offset - MAX_PREFIX_CHARS), offset);
+                    const suffix = fullText.slice(offset, Math.min(fullText.length, offset + MAX_SUFFIX_CHARS));
+
+                    const suggestions = await fetchSuggestions({
+                        url: generateSuggestionsUrl,
+                        idToken,
+                        payload: {
+                            filePath: document.uri.fsPath,
+                            languageId: document.languageId,
+                            prefix,
+                            suffix,
+                            line: position.line,
+                            character: position.character,
+                            n: 5,
+                            temperature: 0.2
+                        },
+                        token: _token
+                    });
+
+                    // 1) sanitize each suggestion just like inline does
+                    // 2) drop empties
+                    // 3) de-dupe (same as earlier advice)
+                    const seen = new Set<string>();
+                    const items: vscode.CompletionItem[] = [];
+
+                    for (const s of suggestions || []) {
+                        const rawText = s.text ?? "";
+                        const { text, range } = sanitizeInlineSuggestion(rawText, document, position);
+                        const norm = text.replace(/\s+/g, " ").trim();
+                        if (!norm || seen.has(norm)) {continue;}
+                        seen.add(norm);
+
+                        const ci = new vscode.CompletionItem(
+                            (s.filterText ?? norm).slice(0, 60),
+                            vscode.CompletionItemKind.Snippet
+                        );
+
+                        // IMPORTANT: use the sanitized range so the completion replaces the right span
+                        ci.range = range;                                // ← controls both insert & replace
+                        ci.insertText = new vscode.SnippetString(text);  // still supports tabstops if present
+                        ci.filterText = s.filterText ?? norm;
+                        ci.sortText = "~~~";
+                        ci.preselect = true;
+
+                        items.push(ci);
+                    }
+
+                    return new vscode.CompletionList(items, true);
+                } catch {
+                    return new vscode.CompletionList([], false);
+                }
+            }
+        },
+        ".", " ", "(", "[", "{", "<"
+    );
+
+    extensionContext.subscriptions.push(completionProvider);
 }
 
+let firstSuggestCompleted = false;
+
+async function fetchSuggestions({
+    url,
+    idToken,
+    payload,
+    token,
+    timeoutMs = 4000,              // bump from 1800 → 4000
+}: {
+    url: string;
+    idToken: string;
+    payload: any;
+    token: vscode.CancellationToken;
+    timeoutMs?: number;
+}): Promise<Array<{ text: string; filterText?: string }>> {
+    // Longer timeout for the first call (cold starts)
+    const effectiveTimeout = firstSuggestCompleted ? timeoutMs : Math.max(timeoutMs, 8000);
+
+    const controller = new AbortController();
+    const disposables: vscode.Disposable[] = [];
+    try {
+        if (token) {
+            // VS Code cancels when the user keeps typing; treat as normal
+            const d = token.onCancellationRequested(() => {
+                try {
+                    controller.abort();
+                } catch { }
+            });
+            disposables.push(d);
+        }
+
+        const t = setTimeout(() => {
+            try {
+                // pass a reason if your TS/Node supports it, but not required
+                controller.abort();
+            } catch { }
+        }, effectiveTimeout);
+
+        // One attempt + optional lightweight retry on 429/5xx if not aborted
+        const attempt = async (): Promise<Response> => {
+            return fetch(url, {
+                method: "POST",
+                signal: controller.signal,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${idToken}`,
+                },
+                body: JSON.stringify(payload),
+            });
+        };
+
+        let res = await attempt();
+
+        // Retry once for transient server errors (not if aborted, and not for 401/403)
+        if (!res.ok && !controller.signal.aborted && (res.status === 429 || res.status >= 500)) {
+            await new Promise(r => setTimeout(r, 150)); // tiny backoff
+            res = await attempt();
+        }
+
+        clearTimeout(t);
+
+        if (controller.signal.aborted) {
+            // Silent exit on cancellation/timeout
+            return [];
+        }
+
+        if (!res.ok) {
+            // Silent on auth errors (user signed out) to avoid noisy UX
+            if (res.status === 401 || res.status === 403) {
+                return [];
+            }
+            // Other HTTP failures → also return empty; keep inline smooth
+            return [];
+        }
+
+        const json = await res.json().catch(() => ({}));
+        const out = Array.isArray(json?.suggestions) ? json.suggestions : [];
+        firstSuggestCompleted = true;
+        return out;
+    } catch (err: any) {
+        // Abort is normal; don’t warn
+        if (err?.name === "AbortError" || err?.code === "ABORT_ERR") {
+            return [];
+        }
+        // Network hiccup → fail silent
+        return [];
+    } finally {
+        // Clean up
+        for (const d of disposables) {
+            try {
+                d.dispose();
+            } catch { }
+        }
+    }
+}
+
+// --- Hash helper (fast & tiny) ----------------------------------------------
+function hash(s: string): number {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+}
 
 // Helper to run a graph build with status bar progress updates
 export async function buildGraphWithStatus(filesToProcess?: vscode.Uri[]) {
@@ -433,7 +697,7 @@ async function querySemanticGraph(queryText: string, maxDepth: number = 2, simil
     const relevantNodes: INode[] = [];
     const queue: { nodeId: string, depth: number }[] = [];
 
-    
+
     const queryEmbedding = await getEmbeddingViaCloudFunction(queryText, statToken);
 
     if (!queryEmbedding) {
@@ -1299,3 +1563,72 @@ async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
         vscode.window.showErrorMessage('SaralFlow: Failed to apply code changes.');
     }
 }
+
+/** Longest length L such that suffix of A (len L) == prefix of B (len L). */
+function commonSuffixPrefixLen(a: string, b: string): number {
+    const maxL = Math.min(a.length, b.length);
+    for (let l = maxL; l > 0; l--) {
+        if (a.slice(a.length - l) === b.slice(0, l)) {
+            return l;
+        }
+    }
+    return 0;
+}
+
+/** Longest length L such that suffix of A (len L) == prefix of B (len L). */
+function commonEndStartLen(a: string, b: string): number {
+    // Same logic as above; kept separate for readability
+    return commonSuffixPrefixLen(a, b);
+}
+
+/**
+ * Clean a raw suggestion so it inserts correctly at the caret:
+ * - Trim anything already typed (line prefix).
+ * - Overwrite any mirrored text after the caret (line suffix).
+ * Returns cleaned text + range to replace.
+ */
+function sanitizeInlineSuggestion(
+    raw: string,
+    document: vscode.TextDocument,
+    position: vscode.Position
+): { text: string; range: vscode.Range } {
+    let text = raw ?? "";
+    const fullLine = document.lineAt(position.line).text;
+    const linePrefix = fullLine.slice(0, position.character);
+    const lineSuffix = fullLine.slice(position.character);
+
+    // 1) Trim what’s already typed (match tail of prefix to head of suggestion)
+    const typedOverlap = commonSuffixPrefixLen(linePrefix, text);
+    if (typedOverlap > 0) {
+        text = text.slice(typedOverlap);
+    }
+
+    // 2) Plan to overwrite any mirrored suffix the model repeated
+    // Only look at a bounded window (keeps it safe/fast on long lines)
+    const SUFFIX_WINDOW = 200;
+    const suffixSlice = lineSuffix.slice(0, SUFFIX_WINDOW);
+
+    const repeatAhead = commonEndStartLen(text, suffixSlice);
+    const replaceEnd = position.with({
+        line: position.line,
+        character: position.character + repeatAhead
+    });
+
+    // 3) If suggestion starts with redundant whitespace and the caret is already
+    //    at whitespace, trim the leading whitespace from suggestion.
+    if (text.length > 0) {
+        const startsWS = /^\s+/.exec(text);
+        if (startsWS && startsWS[0].length > 0 && /\s$/.test(linePrefix)) {
+            text = text.replace(/^\s+/, "");
+        }
+    }
+
+    // 4) Final guard: don’t return empty inserts
+    if (text.length === 0) {
+        // Replace nothing; VS Code treats empty text as "no suggestion".
+        return { text: "", range: new vscode.Range(position, position) };
+    }
+
+    return { text, range: new vscode.Range(position, replaceEnd) };
+}
+

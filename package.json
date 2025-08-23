@@ -46,9 +46,16 @@
           "default": "https://us-central1-saralflowapis.cloudfunctions.net/generateEmbedding",
           "description": "The URL for the SaralFlow 'generateEmbedding' Cloud Function."
         },
+        "saralflow.cloudFunctions.suggestUrl": {
+          "type": "string",
+          "default": "https://us-central1-saralflowapis.cloudfunctions.net/getSuggestions",
+          "description": "Endpoint for code suggestions."
+        },
         "saralflow.graph.include": {
           "type": "array",
-          "default": ["**/*"],
+          "default": [
+            "**/*"
+          ],
           "description": "Glob patterns to include for graph building. Defaults to all supported source files."
         },
         "saralflow.graph.exclude": {
@@ -79,6 +86,21 @@
             "**/yarn.lock"
           ],
           "description": "Glob patterns to exclude from graph building."
+        },
+        "saralflow.inlineEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline (ghost text) suggestions."
+        },
+        "saralflow.maxPrefixChars": {
+          "type": "number",
+          "default": 4000,
+          "description": "Max characters of prefix sent for suggestions."
+        },
+        "saralflow.maxSuffixChars": {
+          "type": "number",
+          "default": 2000,
+          "description": "Max characters of suffix sent for suggestions."
         }
       }
     }
