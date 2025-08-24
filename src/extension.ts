@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 import { CodeGraph, INode, EdgeType } from './graphTypes';
 import { getEmbeddingViaCloudFunction, cosineSimilarity } from './embeddingService';
 import { extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, statToken, graphBuildInProgress, pendingFileChanges, getGraphGlobs } from './graphBuilder';
@@ -13,6 +14,13 @@ const generateCodeFunctionUrl = config.get<string>('cloudFunctions.generateCodeU
     || 'https://us-central1-saralflowapis.cloudfunctions.net/generateCode';
 const generateSuggestionsUrl = config.get<string>("cloudFunctions.suggestUrl")
     || "https://us-central1-saralflowapis.cloudfunctions.net/getSuggestions";
+
+let pendingGoogleState: string | null = null;
+const GOOGLE_AUTH_HOSTED_URL = "https://saralflowapis.web.app/";
+
+const mintTokenUrl = config.get<string>('cloudFunctions.mintCustomToken')
+    || "https://us-central1-saralflowapis.cloudfunctions.net/mintCustomToken";
+const claimUrl = "https://us-central1-saralflowapis.cloudfunctions.net/claimRefreshToken";
 
 const DiffMatchPatch: any = require('diff-match-patch');
 
@@ -44,6 +52,15 @@ const fileToNodeIds = new Map<string, Set<string>>(); // key: uri.toString()
 const FIREBASE_WEB_API_KEY = "AIzaSyD-ufVjCUr7Ub_7arhrW5tqwfk9N_QPsfw";
 let authMgr: FirebaseAuthManager;
 
+
+function makeNonce(): string {
+    return crypto.randomBytes(16).toString("hex");
+}
+
+function buildDeepLink(extensionContext: vscode.ExtensionContext): vscode.Uri {
+    // vscode://<publisher>.<extension>/auth
+    return vscode.Uri.parse(`vscode://${extensionContext.extension.id}/auth`);
+}
 
 function getNodesForUri(uriStr: string): INode[] {
     // semanticGraph.nodes is a Map<string, INode>
@@ -522,7 +539,7 @@ export async function activate(vsContext: vscode.ExtensionContext) {
                         const rawText = s.text ?? "";
                         const { text, range } = sanitizeInlineSuggestion(rawText, document, position);
                         const norm = text.replace(/\s+/g, " ").trim();
-                        if (!norm || seen.has(norm)) {continue;}
+                        if (!norm || seen.has(norm)) { continue; }
                         seen.add(norm);
 
                         const ci = new vscode.CompletionItem(
@@ -548,8 +565,80 @@ export async function activate(vsContext: vscode.ExtensionContext) {
         },
         ".", " ", "(", "[", "{", "<"
     );
-
     extensionContext.subscriptions.push(completionProvider);
+
+    const uriHandler: vscode.UriHandler = {
+        async handleUri(uri: vscode.Uri) {
+            try {
+                if (uri.scheme !== "vscode") { return; }
+                if (uri.authority && uri.authority !== "saralstalin.saralflow") { return; }
+                if (uri.path !== "/auth") { return; }
+
+                const q = new URLSearchParams(uri.query);
+                const state = q.get("state") || "";
+                const idToken = q.get("idToken") || "";
+                //const refreshToken = q.get("refreshToken") || "";
+                //const expiresAt = q.get("expiresAt") || "";
+
+                if (!pendingGoogleState || state !== pendingGoogleState) {
+                    pendingGoogleState = null; // clear to avoid stuck state
+                    vscode.window.showErrorMessage("SaralFlow: Invalid sign-in state.");
+                    return;
+                }
+                pendingGoogleState = null;
+
+                if (!idToken /* || !refreshToken */) {
+                    vscode.window.showErrorMessage("SaralFlow: Sign-in failed or was cancelled.");
+                    return;
+                }
+
+                // Persist
+                await extensionContext.secrets.store("firebaseIdToken", idToken);
+
+
+                const claimedRefresh = await claimRefreshToken(claimUrl, idToken, state);
+                if (claimedRefresh) {
+                    await extensionContext.secrets.store("firebaseRefreshToken", claimedRefresh);
+                }
+
+                // Host-side auth manager
+                try {
+                    await authMgr.loadFromSecrets();
+                    await authMgr.ensureSignedIn();
+                } catch {
+                    // best-effort
+                }
+
+                // Mint a webview custom token and push it in
+                try {
+                    const customToken = await mintCustomToken(mintTokenUrl, idToken);
+                    codeViewPanel?.webview.postMessage({ command: "firebaseCustomToken", token: customToken });
+
+                    // Optional UX: show email immediately
+                    let email = "";
+                    try {
+                        const payload = JSON.parse(Buffer.from(idToken.split(".")[1] || "", "base64").toString("utf8"));
+                        email = payload?.email || "";
+                    } catch { }
+                    codeViewPanel?.webview.postMessage({
+                        command: "hostAuthState",
+                        isAuthenticated: true,
+                        email,
+                    });
+                } catch (e) {
+                    vscode.window.showErrorMessage("SaralFlow: Could not mint custom token.");
+                    console.error("mintCustomToken failed:", e);
+                }
+
+                vscode.window.showInformationMessage("Signed in with Google.");
+                codeViewPanel?.webview.postMessage({ command: "googleSignInComplete" }); // optional; UI state is driven by onIdTokenChanged
+            } catch (e) {
+                vscode.window.showErrorMessage("SaralFlow: Google sign-in error.");
+                console.error("[SaralFlow] handleUri error:", e);
+            }
+        }
+    };
+    extensionContext.subscriptions.push(vscode.window.registerUriHandler(uriHandler));
 }
 
 let firstSuggestCompleted = false;
@@ -1263,6 +1352,22 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                         codeViewPanel.webview.postMessage({ command: 'hideLoading' });
                     }
                     break;
+                case 'startGoogleSignIn': {
+                    try {
+                        const state = makeNonce();
+                        pendingGoogleState = state;
+
+                        const deepLink = buildDeepLink(extensionContext); // vscode://publisher.extension/auth
+                        const url = vscode.Uri.parse(
+                            `${GOOGLE_AUTH_HOSTED_URL}?state=${encodeURIComponent(state)}&deeplink=${encodeURIComponent(deepLink.toString())}`
+                        );
+                        await vscode.env.openExternal(url);
+                    } catch (e) {
+                        vscode.window.showErrorMessage("SaralFlow: Unable to start Google sign-in.");
+                        console.error("[SaralFlow] startGoogleSignIn error:", e);
+                    }
+                    break;
+                }
 
                 case 'applySelectedChanges': {
                     const selectedChanges = message.changes as ProposedFileChange[];
@@ -1632,3 +1737,51 @@ function sanitizeInlineSuggestion(
     return { text, range: new vscode.Range(position, replaceEnd) };
 }
 
+async function mintCustomToken(functionUrl: string, idToken: string): Promise<string> {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 10_000);
+
+    try {
+        const resp = await fetch(functionUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${idToken.trim()}`
+            },
+            // body can be empty; keep it if your function expects JSON
+            body: JSON.stringify({}),
+            signal: ac.signal,
+        });
+
+        const text = await resp.text();
+        if (!resp.ok) { throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`); }
+
+        let json: any;
+        try { json = JSON.parse(text); } catch { throw new Error("Response was not valid JSON."); }
+
+        const token = json?.customToken;
+        if (!token) {throw new Error("No customToken in response.");}
+        return token;
+    } finally {
+        clearTimeout(t);
+    }
+}
+
+
+async function claimRefreshToken(claimUrl: string, idToken: string, state: string): Promise<string | null> {
+    const resp = await fetch(claimUrl, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ state })
+    });
+    const text = await resp.text();
+    if (!resp.ok) {
+        console.warn("claimRefreshToken failed:", resp.status, text);
+        return null;
+    }
+    const json = JSON.parse(text);
+    return json?.refreshToken || null;
+}

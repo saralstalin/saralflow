@@ -26,6 +26,7 @@ applyStatusMessage.style.color = 'var(--vscode-editor-foreground)';
 
 const userNameSpan = document.getElementById('userName');
 const logoutButton = document.getElementById('logoutButton');
+const googleSignInButton = document.getElementById('googleSignInButton');
 
 const progressDetails = document.createElement('details');
 progressDetails.id = 'progressBox';
@@ -79,6 +80,12 @@ progressDetails.appendChild(progressContainer);
 // Attach under your loading message or wherever you want it to live
 if (loadingMessage && loadingMessage.parentElement) {
     loadingMessage.parentElement.insertBefore(progressDetails, loadingMessage.nextSibling);
+}
+
+if (googleSignInButton) {
+    googleSignInButton.addEventListener('click', () => {
+        vscode.postMessage({ command: 'startGoogleSignIn' });
+    });
 }
 
 // ----- logic (same API as before, with summary helpers) -----

@@ -3,7 +3,7 @@
   "displayName": "SaralFlow - Developer Preview",
   "publisher": "SaralStalin",
   "description": "Auto generate code changes from story description",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "engines": {
     "vscode": "^1.102.0"
   },
