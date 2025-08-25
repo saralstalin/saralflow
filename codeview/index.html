@@ -1,13 +1,16 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{webview.cspSource}} 'unsafe-inline'; script-src 'nonce-{{nonce}}' https://www.gstatic.com; connect-src https://*.firebaseio.com https://*.firebaseauth.com https://securetoken.googleapis.com https://identitytoolkit.googleapis.com;">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; img-src https: data:; style-src {{webview.cspSource}} 'unsafe-inline'; script-src 'nonce-{{nonce}}' https://www.gstatic.com; connect-src https://*.firebaseio.com https://*.firebaseauth.com https://securetoken.googleapis.com https://identitytoolkit.googleapis.com;">
     <link href="{{styleUri}}" rel="stylesheet">
     <link href="{{prismCssUri}}" rel="stylesheet">
     <title>SaralFlow : Story to Code</title>
 </head>
+
 <body>
     <div id="auth-section">
         <h2>Login or Register to use SaralFlow</h2>
@@ -19,7 +22,7 @@
             <label for="passwordInput">Password</label>
             <input type="password" id="passwordInput" placeholder="Password" />
         </div>
-         <div class="input-group hidden" id="confirmPasswordGroup">
+        <div class="input-group hidden" id="confirmPasswordGroup">
             <label for="confirmPasswordInput">Confirm Password</label>
             <input type="password" id="confirmPasswordInput" placeholder="Confirm Password" />
         </div>
@@ -27,7 +30,13 @@
             <button id="loginButton">Login</button>
             <button id="registerButton">Register</button>
         </div>
-        <button id="googleSignInButton" class="btn btn-google">Continue with Google</button>
+        <div class="button-row">
+            <button id="googleSignInButton" class="google-btn" type="button" aria-label="Continue with Google">
+                <img class="google-icon" src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
+                    alt="">
+                <span>Continue with Google</span>
+            </button>
+        </div>
         <p id="authStatus"></p>
     </div>
     <div id="app-section" class="hidden">
@@ -35,7 +44,8 @@
             <p>Welcome, <span id="userName"></span>! <a href="#" id="logoutButton">Logout</a></p>
         </div>
         <p>Describe the feature or change you want to implement:</p>
-        <textarea id="userStory" rows="10" cols="60" placeholder="e.g., 'As a user, I want to add a new API endpoint that lists all products with a 'special' tag.'"></textarea>
+        <textarea id="userStory" rows="10" cols="60"
+            placeholder="e.g., 'As a user, I want to add a new API endpoint that lists all products with a 'special' tag.'"></textarea>
         <br>
         <button id="generateButton">Generate Code</button>
         <hr>
@@ -55,4 +65,5 @@
     <script nonce="{{nonce}}" src="{{prismPythonUri}}"></script>
     <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
 </body>
+
 </html>
