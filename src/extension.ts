@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
-import { CodeGraph, INode, EdgeType } from './graphTypes';
+import { CodeGraph, INode, EdgeType } from './types/graphTypes';
 import { getEmbeddingViaCloudFunction, cosineSimilarity } from './embeddingService';
 import { extractSemanticGraph, removeFileNodesFromGraph, reEmbedGraphNodes, statToken, graphBuildInProgress, pendingFileChanges, getGraphGlobs } from './graphBuilder';
 const config = vscode.workspace.getConfiguration('saralflow');

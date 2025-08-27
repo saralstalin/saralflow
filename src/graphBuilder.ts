@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { CodeGraph, INode, EdgeType, generateNodeId } from './graphTypes';
+import { CodeGraph, INode, EdgeType, generateNodeId } from './types/graphTypes';
 import { getEmbeddingViaCloudFunction } from './embeddingService';
 import { semanticGraph, buildGraphWithStatus, suppressPathOnce, graphSearch } from './extension';
 import pLimit from 'p-limit';
