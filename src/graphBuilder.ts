@@ -7,7 +7,6 @@ import { getEmbeddingViaCloudFunction } from './embeddingService';
 import { semanticGraph, buildGraphWithStatus, suppressPathOnce, graphSearch } from './extension';
 import pLimit from 'p-limit';
 import { minimatch } from "minimatch";
-import { GraphSearch } from './graphSearch';
 
 // ===== Tunables =====
 const CPU_COUNT = Math.max(1, os.cpus?.().length || 4);

@@ -1,4 +1,3 @@
-// search/GraphSearch.ts
 import type { ISemanticGraph, INode } from './types/graphTypes';
 import { PackedCosineIndex } from './packedCosineIndex';
 

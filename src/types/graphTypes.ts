@@ -1,5 +1,3 @@
-// src/graphTypes.ts
-
 import * as vscode from 'vscode';
 
 // A numeric enum for Node kinds, to be used for internal graph logic.

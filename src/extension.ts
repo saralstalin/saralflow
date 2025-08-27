@@ -1121,19 +1121,25 @@ async function proposeCodeFromStory(userStory: string) {
 
 
 function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
-    // ---------- Tunables (seeds = similarity only) ----------
-    const MIN_KEEP = 2;        // always keep top-2 seeds
-    const MAX_KEEP = 7;        // total seeds to consider (upper bound before expansion)
-    const ALPHA = 0.86;        // dynamic threshold = ALPHA * bestScore
-    const ABS_MIN = 0.32;      // absolute score floor
+    // ---------- Tunables ----------
+    const MIN_KEEP = 2;                 // always keep top-2 seeds
+    const MAX_KEEP_BASE = 7;            // normal max seeds
+    const MAX_KEEP_CAP = 20;           // hard cap for widened seeding (similarity-only fallback)
+    const ALPHA_BASE = 0.86;            // dynamic threshold = ALPHA * bestScore
+    const ABS_MIN_BASE = 0.32;          // absolute score floor
 
-    // ---------- Expansion (graph-only) ----------
-    const EXPAND_DEPTH = 2;        // BFS depth from seeds
-    const EXPAND_DECAY = 0.85;     // per-step decay
-    const PER_SEED_LIMIT = 3;      // max neighbors to pull per seed
-    const RELATED_MAX = 8;         // cap on total related items returned (after seeds)
+    // Expansion (graph-only)
+    const EXPAND_DEPTH = 2;
+    const EXPAND_DECAY = 0.85;
+    const PER_SEED_LIMIT = 3;
+    const RELATED_MAX = 8;
+    const MAX_TOTAL = 20;
 
-    // Per-edge weights for expansion
+    // If after expansion we still have fewer than this many (seeds + related),
+    // we’ll widen seeds and/or fill purely by similarity.
+    const MIN_TOTAL_TARGET = 5;
+
+    // Per-edge weights
     const EDGE_W: Record<EdgeType, number> = {
         [EdgeType.CALLS]: 1.0,
         [EdgeType.CALLED_BY]: 1.0,
@@ -1148,22 +1154,56 @@ function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
     } as any;
 
     // ---------- Helpers ----------
-    function selectSeeds(scored: Array<{ node: INode; s: number }>): INode[] {
-        if (scored.length === 0) { return []; }
+    function rankBySimilarity(): Array<{ node: INode; s: number }> {
+        let scored: Array<{ node: INode; s: number }> = [];
+        if (graphSearch) {
+            const CANDIDATES = 80; // a bit higher to support widening
+            const hits = graphSearch.search(storyEmbedding, CANDIDATES); // -> { node, score }
+            scored = hits
+                .filter(h => !!h.node?.embedding)
+                .map(h => ({ node: h.node, s: h.score ?? 0 }));
+        } else {
+            if (!semanticGraph || semanticGraph.nodes.size === 0) { return []; }
+            for (const node of semanticGraph.nodes.values()) {
+                if (!node.embedding) { continue; }
+                const s = cosineSimilarity(storyEmbedding, node.embedding);
+                scored.push({ node, s });
+            }
+        }
         scored.sort((a, b) => b.s - a.s);
+        return scored;
+    }
 
-        // Keep top-2 no matter what
-        const seeds: INode[] = scored.slice(0, Math.min(MIN_KEEP, scored.length)).map(x => x.node);
+    function selectSeeds(
+        scored: Array<{ node: INode; s: number }>,
+        opts?: { alpha?: number; absMin?: number; maxKeep?: number }
+    ): INode[] {
+        if (scored.length === 0) { return []; }
+        const alpha = opts?.alpha ?? ALPHA_BASE;
+        const absMin = opts?.absMin ?? ABS_MIN_BASE;
+        const maxKeep = Math.min(opts?.maxKeep ?? MAX_KEEP_BASE, scored.length);
 
-        // Dynamic threshold on the rest up to MAX_KEEP
+        const seeds: INode[] = [];
         const best = scored[0].s ?? 0;
-        const dynThresh = Math.max(ABS_MIN, best * ALPHA);
-        for (let i = MIN_KEEP; i < scored.length && seeds.length < MAX_KEEP; i++) {
+        const dynThresh = Math.max(absMin, best * alpha);
+
+        // Always keep top MIN_KEEP
+        for (let i = 0; i < Math.min(MIN_KEEP, maxKeep); i++) { seeds.push(scored[i].node); }
+
+        // Fill the rest by dynamic threshold
+        for (let i = MIN_KEEP; i < maxKeep; i++) {
             const { node, s } = scored[i];
             if (s >= dynThresh) { seeds.push(node); }
-            else { break; } // scores sorted
+            else { break; }
         }
-        return seeds;
+
+        // If we still didn’t reach maxKeep (e.g., very peaky similarity),
+        // pad up to maxKeep anyway to ensure we have enough seeds in sparse graphs.
+        for (let i = seeds.length; i < maxKeep; i++) { seeds.push(scored[i].node); }
+
+        // Dedup in order
+        const seen = new Set<string>();
+        return seeds.filter(n => (n && !seen.has(n.id) ? (seen.add(n.id), true) : false));
     }
 
     function getNeighbors(nodeId: string): Array<{ id: string; type: EdgeType }> {
@@ -1173,10 +1213,9 @@ function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
         for (const e of edges) {
             if (e.from === nodeId && e.to) { out.push({ id: e.to, type: e.label as EdgeType }); }
             if (e.to === nodeId && e.from) {
-                // Provide reverse traversal for symmetry
                 const t = (e.label as EdgeType) === EdgeType.CALLS ? EdgeType.CALLED_BY :
                     (e.label as EdgeType) === EdgeType.CALLED_BY ? EdgeType.CALLS :
-                        e.label as EdgeType;
+                        (e.label as EdgeType);
                 out.push({ id: e.from, type: t });
             }
         }
@@ -1184,93 +1223,109 @@ function findRelevantNodesByStory(storyEmbedding: number[]): INode[] {
     }
 
     function uniqueInOrder<T>(arr: T[], key: (x: T) => string): T[] {
-        const seen = new Set<string>();
-        const out: T[] = [];
-        for (const x of arr) {
-            const k = key(x);
-            if (!seen.has(k)) { seen.add(k); out.push(x); }
-        }
+        const seen = new Set<string>(), out: T[] = [];
+        for (const x of arr) { const k = key(x); if (!seen.has(k)) { seen.add(k); out.push(x); } }
         return out;
     }
 
-    // ---------- Phase 1: Similarity-only seeds ----------
-    let scored: Array<{ node: INode; s: number }> = [];
+    // ---------- Phase 1: Similarity-ranking ----------
+    const scored = rankBySimilarity();
+    if (scored.length === 0) { return []; }
 
-    if (graphSearch) {
-        const CANDIDATES = Math.max(MAX_KEEP * 4, 40);
-        const hits = graphSearch.search(storyEmbedding, CANDIDATES); // -> { node, score }
-        scored = hits
-            .filter(h => !!h.node?.embedding)
-            .map(h => ({ node: h.node, s: h.score ?? 0 }));
-    } else {
-        if (!semanticGraph || semanticGraph.nodes.size === 0) { return []; }
-        for (const node of semanticGraph.nodes.values()) {
-            if (!node.embedding) { continue; }
-            const s = cosineSimilarity(storyEmbedding, node.embedding);
-            scored.push({ node, s });
-        }
-    }
-
-    const seedNodes = selectSeeds(scored);
+    // First-pass seeding (original behavior)
+    let seedNodes = selectSeeds(scored, { alpha: ALPHA_BASE, absMin: ABS_MIN_BASE, maxKeep: MAX_KEEP_BASE });
     if (seedNodes.length === 0) { return []; }
 
-    // ---------- Phase 2: Graph-only expansion ----------
-    // BFS from each seed, score neighbors only by edge weights and decay. No similarity used here.
-    const seedIds = new Set(seedNodes.map(n => n.id));
-    const relatedScores = new Map<string, number>(); // nodeId -> score
-    const relatedBySeedCount = new Map<string, number>(); // per-seed quota
+    // ---------- Phase 2: Graph expansion from seeds ----------
+    function expandFromSeeds(seeds: INode[]): INode[] {
+        const seedIds = new Set(seeds.map(n => n.id));
+        const relatedScores = new Map<string, number>();
+        const relatedBySeedCount = new Map<string, number>();
 
-    for (const seed of seedNodes) {
-        relatedBySeedCount.set(seed.id, 0);
+        for (const seed of seeds) {
+            relatedBySeedCount.set(seed.id, 0);
 
-        // frontier: [nodeId, depth, strength]
-        const frontier: Array<{ id: string; depth: number; strength: number }> = [{ id: seed.id, depth: 0, strength: 1 }];
+            const frontier: Array<{ id: string; depth: number; strength: number }> =
+                [{ id: seed.id, depth: 0, strength: 1 }];
 
-        const visited = new Set<string>([seed.id]);
+            const visited = new Set<string>([seed.id]);
 
-        while (frontier.length) {
-            const cur = frontier.shift()!;
-            if (cur.depth >= EXPAND_DEPTH) { continue; }
+            while (frontier.length) {
+                const cur = frontier.shift()!;
+                if (cur.depth >= EXPAND_DEPTH) { continue; }
 
-            const nbrs = getNeighbors(cur.id);
-            for (const nb of nbrs) {
-                if (visited.has(nb.id)) { continue; }
-                visited.add(nb.id);
+                const nbrs = getNeighbors(cur.id);
+                for (const nb of nbrs) {
+                    if (visited.has(nb.id)) { continue; }
+                    visited.add(nb.id);
 
-                // Compute contribution
-                const w = EDGE_W[nb.type] ?? 0.5;
-                const nextStrength = cur.strength * w * EXPAND_DECAY;
+                    const w = EDGE_W[nb.type] ?? 0.5;
+                    const nextStrength = cur.strength * w * EXPAND_DECAY;
+                    if (nextStrength < 1e-4) { continue; }
 
-                // Skip if extremely weak
-                if (nextStrength < 1e-4) { continue; }
-
-                // Do not count seeds as related
-                if (!seedIds.has(nb.id)) {
-                    // Enforce per-seed cap
-                    const used = relatedBySeedCount.get(seed.id)!;
-                    if (used < PER_SEED_LIMIT) {
-                        relatedScores.set(nb.id, (relatedScores.get(nb.id) || 0) + nextStrength);
-                        relatedBySeedCount.set(seed.id, used + 1);
+                    if (!seedIds.has(nb.id)) {
+                        const used = relatedBySeedCount.get(seed.id)!;
+                        if (used < PER_SEED_LIMIT) {
+                            relatedScores.set(nb.id, (relatedScores.get(nb.id) || 0) + nextStrength);
+                            relatedBySeedCount.set(seed.id, used + 1);
+                        }
                     }
+                    frontier.push({ id: nb.id, depth: cur.depth + 1, strength: nextStrength });
                 }
-
-                // Enqueue further traversal
-                frontier.push({ id: nb.id, depth: cur.depth + 1, strength: nextStrength });
             }
+        }
+
+        const relatedSorted: INode[] = [...relatedScores.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, RELATED_MAX)
+            .map(([id]) => semanticGraph?.nodes.get(id))
+            .filter(Boolean) as INode[];
+
+        return relatedSorted;
+    }
+
+    let related = expandFromSeeds(seedNodes);
+
+    // ---------- Adaptive widening when graph is sparse ----------
+    // If total is too small, widen seeds (lower ALPHA, raise maxKeep), then re-expand once.
+    if (seedNodes.length + related.length < MIN_TOTAL_TARGET) {
+        const WIDE_ALPHA = 0.7;                      // more permissive
+        const WIDE_ABS_MIN = Math.max(ABS_MIN_BASE * 0.8, 0.24);
+        const WIDE_MAX_KEEP = Math.min(MAX_KEEP_CAP, Math.max(MAX_KEEP_BASE * 2, 14));
+
+        const widenedSeeds = selectSeeds(scored, {
+            alpha: WIDE_ALPHA,
+            absMin: WIDE_ABS_MIN,
+            maxKeep: WIDE_MAX_KEEP
+        });
+
+        // Only re-expand if we actually got more seeds
+        if (widenedSeeds.length > seedNodes.length) {
+            seedNodes = widenedSeeds;
+            related = expandFromSeeds(seedNodes);
         }
     }
 
-    // Build related list from scores (highest first), ignoring seeds
-    const relatedSorted: INode[] = [...relatedScores.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, RELATED_MAX)
-        .map(([id]) => semanticGraph?.nodes.get(id))
-        .filter(Boolean) as INode[];
+    // ---------- Similarity-only fill to target (no graph needed) ----------
+    // If we’re still short (e.g., no edges at all), add more top-similarity nodes (non-seeds) up to cap.
+    const haveIds = new Set<string>([...seedNodes.map(n => n.id), ...related.map(n => n.id)]);
+    if (seedNodes.length + related.length < MIN_TOTAL_TARGET) {
+        const need = Math.min(MAX_KEEP_CAP, MIN_TOTAL_TARGET) - (seedNodes.length + related.length);
+        const fillers: INode[] = [];
+        for (const { node } of scored) {
+            if (fillers.length >= need) { break; }
+            if (!haveIds.has(node.id)) {
+                fillers.push(node);
+                haveIds.add(node.id);
+            }
+        }
+        related = [...related, ...fillers];
+    }
 
-    // ---------- Final: seeds first (most relevant), then related (graph neighbors) ----------
-    const ordered = uniqueInOrder<INode>([...seedNodes, ...relatedSorted], n => n.id);
-    return ordered;
+    // ---------- Final ordering: seeds first, then related ----------
+    return uniqueInOrder<INode>([...seedNodes, ...related], n => n.id).slice(0, MAX_TOTAL);
 }
+
 
 function openSaralFlowWebview(extensionUri: vscode.Uri) {
     // If a panel already exists, just reveal it
@@ -1760,7 +1815,7 @@ async function mintCustomToken(functionUrl: string, idToken: string): Promise<st
         try { json = JSON.parse(text); } catch { throw new Error("Response was not valid JSON."); }
 
         const token = json?.customToken;
-        if (!token) {throw new Error("No customToken in response.");}
+        if (!token) { throw new Error("No customToken in response."); }
         return token;
     } finally {
         clearTimeout(t);

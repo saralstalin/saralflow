@@ -1,4 +1,3 @@
-// search/PackedCosineIndex.ts
 export type NodeId = string;
 
 export class PackedCosineIndex {
