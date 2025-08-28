@@ -378,3 +378,12 @@ body.vscode-high-contrast-light .google-btn {
   justify-content: center;   /* 👈 centers children horizontally */
   margin-top: 12px;
 }
+
+.explanation-plain {
+  white-space: pre-line;   /* show \n as line breaks; collapse multiple spaces */
+  line-height: 1.45;
+  margin: 6px 0;
+}
+
+/* optional: smaller spacing between lines that look like bullets */
+.explanation-plain { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }

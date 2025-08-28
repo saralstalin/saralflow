@@ -88,6 +88,14 @@ if (googleSignInButton) {
     });
 }
 
+if (typeof marked !== 'undefined') {
+    marked.setOptions({
+        gfm: true,
+        breaks: false,   // don't force <br> on single \n
+        smartLists: true
+    });
+}
+
 // ----- logic (same API as before, with summary helpers) -----
 const DEFAULT_STEPS = [
     { id: 'understand', label: 'Understanding story', status: 'pending' },
@@ -496,7 +504,12 @@ function displayParsedResult(explanation, fileChanges) {
     applySelectedButton.style.display = 'block';
 
     if (explanation) {
-        resultDiv.innerHTML += `<h3>Explanation:</h3><div class="explanation-text">${marked.parse(explanation)}</div>`;
+        const cleaned = normalizeExplanation(explanation);
+        const wrap = document.createElement('div');
+        wrap.innerHTML = `<h3>Explanation:</h3><div class="explanation-plain"></div>`;
+        const pre = wrap.querySelector('.explanation-plain');
+        pre.textContent = cleaned; // ← preserves numbers & newlines safely
+        resultDiv.appendChild(wrap);
     }
 
     if (fileChanges && fileChanges.length > 0) {
@@ -590,4 +603,32 @@ window.onload = () => {
 function isValidEmail(email) {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     return emailRegex.test(email);
+}
+
+function compactMarkdown(md) {
+    return md
+        .replace(/\r/g, '')
+        .replace(/[ \t]+\n/g, '\n')   // trim trailing spaces
+        .replace(/\n{3,}/g, '\n\n')   // collapse 3+ blanks to one blank line
+        .trim();
+}
+
+function normalizeExplanation(text) {
+    const lines = text.replace(/\r/g, '').split('\n');
+    const out = [];
+    let lastWasBlank = true; // drop leading blanks
+
+    for (let raw of lines) {
+        const line = raw.replace(/[ \t]+$/g, ''); // trim trailing spaces/tabs
+        const isBlank = line.trim().length === 0; // treat whitespace-only as blank
+        if (isBlank) {
+            if (!lastWasBlank) { out.push(''); lastWasBlank = true; }
+        } else {
+            out.push(line);
+            lastWasBlank = false;
+        }
+    }
+    while (out.length && out[0] === '') { out.shift(); }
+    while (out.length && out[out.length - 1] === '') { out.pop(); }
+    return out.join('\n');
 }

@@ -51,6 +51,8 @@ const fileToNodeIds = new Map<string, Set<string>>(); // key: uri.toString()
 
 const FIREBASE_WEB_API_KEY = "AIzaSyD-ufVjCUr7Ub_7arhrW5tqwfk9N_QPsfw";
 let authMgr: FirebaseAuthManager;
+const contents = new Map<string, string>();
+const emitter = new vscode.EventEmitter<vscode.Uri>();
 
 
 function makeNonce(): string {
@@ -639,6 +641,15 @@ export async function activate(vsContext: vscode.ExtensionContext) {
         }
     };
     extensionContext.subscriptions.push(vscode.window.registerUriHandler(uriHandler));
+
+    extensionContext.subscriptions.push(
+        vscode.workspace.registerTextDocumentContentProvider('preview-diff', {
+            onDidChange: emitter.event,
+            provideTextDocumentContent(uri) {
+                return contents.get(uri.toString()) ?? '';
+            }
+        })
+    );
 }
 
 let firstSuggestCompleted = false;
@@ -1435,13 +1446,23 @@ function openSaralFlowWebview(extensionUri: vscode.Uri) {
                 }
 
                 case 'showDiff': {
-                    const leftUri = vscode.Uri.file(path.join(vscode.workspace.rootPath || '', message.filePath));
-                    const rightDoc = await vscode.workspace.openTextDocument({
-                        content: message.newContent,
-                        language: message.language
-                    });
-                    const rightUri = rightDoc.uri;
-                    vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `Preview Diff: ${message.filePath}`);
+                    const leftUri = vscode.Uri.file(path.join(
+                        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '',
+                        message.filePath
+                    ));
+
+                    // put the new content into the virtual doc
+                    const rightUri = vscode.Uri.parse(`preview-diff:${message.filePath}`);
+                    contents.set(rightUri.toString(), message.newContent);
+
+                    // show the diff on the left group, read-only on the right
+                    await vscode.commands.executeCommand(
+                        'vscode.diff',
+                        leftUri,
+                        rightUri,
+                        `Preview Diff: ${message.filePath}`,
+                        { viewColumn: vscode.ViewColumn.One, preserveFocus: false, preview: true }
+                    );
                     break;
                 }
             }
@@ -1573,10 +1594,8 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
                 parsingExplanation = false;
                 continue;
             }
-            // Append lines to the explanation, but only if they are not blank
-            if (line.trim().length > 0) {
-                explanationLines.push(line);
-            }
+            // Append lines to the explanation (normalize later)
+            explanationLines.push(line);
             continue;
         }
 
@@ -1645,9 +1664,34 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
         }
     }
 
-    return { fileChanges, explanation: explanationLines.join('\n').trim() };
-}
+    // 🔑 Normalize explanation: collapse whitespace-only lines to a single blank line
+    const explanation = (() => {
+        const out: string[] = [];
+        let lastWasBlank = true; // discard leading blanks
 
+        for (const raw of explanationLines) {
+            const line = raw.replace(/\s+$/g, '');           // trim trailing spaces
+            const isBlank = line.trim().length === 0;        // treat whitespace-only as blank
+
+            if (isBlank) {
+                if (!lastWasBlank) {
+                    out.push('');                            // keep a single blank
+                    lastWasBlank = true;
+                }
+            } else {
+                out.push(line);
+                lastWasBlank = false;
+            }
+        }
+
+        // trim trailing blank
+        while (out.length && out[out.length - 1] === '') {out.pop();}
+
+        return out.join('\n');
+    })();
+
+    return { fileChanges, explanation };
+}
 
 
 // This is the unified function to apply code changes using diff-match-patch
