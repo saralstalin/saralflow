@@ -3,7 +3,7 @@
   "displayName": "SaralFlow - Developer Preview",
   "publisher": "SaralStalin",
   "description": "Auto generate code changes from story description, along with type ahead code completion",
-  "version": "1.0.6",
+  "version": "1.1.0",
   "engines": {
     "vscode": "^1.102.0"
   },
@@ -144,7 +144,8 @@
     "marked": "^16.1.1",
     "node-fetch": "^2.7.0",
     "openai": "^5.10.2",
-    "minimatch": "^9.0.3"
+    "minimatch": "^9.0.3",
+    "p-limit": "^3.1.0"
   },
   "repository": {
     "type": "git",
