@@ -1685,7 +1685,7 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
         }
 
         // trim trailing blank
-        while (out.length && out[out.length - 1] === '') {out.pop();}
+        while (out.length && out[out.length - 1] === '') { out.pop(); }
 
         return out.join('\n');
     })();
@@ -1698,75 +1698,127 @@ export async function parseLLMResponse(llmResponse: string): Promise<ParsedLLMRe
 async function applyCodeChanges(changesToApply: ProposedFileChange[]) {
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders || workspaceFolders.length === 0) {
-        vscode.window.showErrorMessage('No workspace folder open to apply changes.');
+        vscode.window.showErrorMessage("No workspace folder open to apply changes.");
         return;
     }
+
     const rootPath = workspaceFolders[0].uri.fsPath;
     const dmp = new DiffMatchPatch();
-
     const edit = new vscode.WorkspaceEdit();
-    let filesOpenedCount = 0;
+
+    let createdCount = 0;
+    let editedCount = 0;
+    let skippedCount = 0;   // existing file but proposed content identical -> no-op
+    let failedCount = 0;
 
     for (const change of changesToApply) {
         const fullPath = path.join(rootPath, change.filePath);
         const fileUri = vscode.Uri.file(fullPath);
 
         if (change.isNewFile) {
-            edit.createFile(fileUri, { ignoreIfExists: false });
-            edit.insert(fileUri, new vscode.Position(0, 0), change.content);
-            filesOpenedCount++;
-        } else {
+            // Create/write new files directly to disk so they persist and trigger watchers
             try {
-                const existingDoc = await vscode.workspace.openTextDocument(fileUri);
-                const originalText = existingDoc.getText();
-                const proposedText = change.content;
+                await safeWriteFile(fileUri, change.content);
+                createdCount++;
+            } catch (err: any) {
+                failedCount++;
+                vscode.window.showErrorMessage(`Failed to create ${change.filePath}: ${err?.message || err}`);
+                console.error("[applyCodeChanges] create error:", change.filePath, err);
+            }
+            continue;
+        }
 
-                const diffs = dmp.diff_main(originalText, proposedText);
-                dmp.diff_cleanupSemantic(diffs);
+        // Existing file: compute diff and stage edits
+        try {
+            const existingDoc = await vscode.workspace.openTextDocument(fileUri);
+            const originalText = existingDoc.getText();
+            const proposedText = change.content;
 
-                let currentOffset = 0;
-                for (const diff of diffs) {
-                    const type = diff[0]; // -1: deletion, 0: equality, 1: insertion
-                    const text = diff[1];
-
-                    if (type === 0) { // Equivalent to dmp.DIFF_EQUAL
-                        currentOffset += text.length;
-                    } else if (type === 1) { // Equivalent to dmp.DIFF_INSERT
-                        const startPos = existingDoc.positionAt(currentOffset);
-                        edit.insert(fileUri, startPos, text);
-                    } else if (type === -1) { // Equivalent to dmp.DIFF_DELETE
-                        const startPos = existingDoc.positionAt(currentOffset);
-                        const endPos = existingDoc.positionAt(currentOffset + text.length);
-                        edit.delete(fileUri, new vscode.Range(startPos, endPos));
-                        currentOffset += text.length;
-                    }
-                }
-                filesOpenedCount++;
-
-            } catch (error: any) {
-                vscode.window.showErrorMessage(`Failed to prepare changes for ${change.filePath}: ${error.message}`);
-                console.error(`Error preparing diff for ${change.filePath}: ${error.message}`);
+            if (originalText === proposedText) {
+                skippedCount++;
                 continue;
             }
+
+            const diffs = dmp.diff_main(originalText, proposedText);
+            dmp.diff_cleanupSemantic(diffs);
+
+            // Build edits relative to the ORIGINAL text positions
+            let offsetInOriginal = 0;
+            let hasRealChange = false;
+
+            for (const [type, text] of diffs as Array<[number, string]>) {
+                if (type === 0) {
+                    // EQUAL -> advance through original
+                    offsetInOriginal += text.length;
+                } else if (type === 1) {
+                    // INSERT -> insert at current original offset (doesn't advance original)
+                    const pos = existingDoc.positionAt(offsetInOriginal);
+                    edit.insert(fileUri, pos, text);
+                    hasRealChange = true;
+                } else if (type === -1) {
+                    // DELETE -> delete range [offset, offset + len) in the ORIGINAL
+                    const start = existingDoc.positionAt(offsetInOriginal);
+                    const end = existingDoc.positionAt(offsetInOriginal + text.length);
+                    edit.delete(fileUri, new vscode.Range(start, end));
+                    offsetInOriginal += text.length; // advance in original for deleted chunk
+                    hasRealChange = true;
+                }
+            }
+
+            if (hasRealChange) {
+                editedCount++;
+            } else {
+                // This should be rare after equality check; treat as skip
+                skippedCount++;
+            }
+        } catch (err: any) {
+            failedCount++;
+            vscode.window.showErrorMessage(`Failed to prepare changes for ${change.filePath}: ${err?.message || err}`);
+            console.error("[applyCodeChanges] diff error:", change.filePath, err);
+            continue;
         }
     }
 
-    if (filesOpenedCount === 0) {
-        vscode.window.showWarningMessage('No changes to apply or no files could be processed.');
-        return;
+    // If we staged any edits for existing files, apply them now
+    if (edit.size > 0) {
+        const success = await vscode.workspace.applyEdit(edit);
+        if (!success) {
+            // If the edit failed entirely, count them as failures
+            failedCount += editedCount;
+            editedCount = 0;
+        }
     }
 
-    // Apply the combined edit
-    const success = await vscode.workspace.applyEdit(edit);
+    // Build an honest summary
+    if (createdCount === 0 && editedCount === 0 && skippedCount === 0 && failedCount === 0) {
+        vscode.window.showWarningMessage("No changes to apply.");
+    } else {
+        const parts: string[] = [];
+        if (createdCount) { parts.push(`created: ${createdCount}`); }
+        if (editedCount) { parts.push(`edited: ${editedCount}`); }
+        if (skippedCount) { parts.push(`unchanged: ${skippedCount}`); }
+        if (failedCount) { parts.push(`failed: ${failedCount}`); }
 
-    if (success && codeViewPanel) {
-        codeViewPanel.webview.postMessage({ command: 'changesApplied' });
-        vscode.window.showInformationMessage('SaralFlow: Code changes applied successfully!');
+        const summary = `SaralFlow: ${parts.join(", ")} files.`;
+        if (failedCount > 0) {
+            vscode.window.showErrorMessage(summary);
+        } else {
+            vscode.window.showInformationMessage(summary);
+        }
     }
-    else {
-        vscode.window.showErrorMessage('SaralFlow: Failed to apply code changes.');
+
+    // Notify webview regardless (it can decide what to do)
+    if (codeViewPanel) {
+        codeViewPanel.webview.postMessage({
+            command: "changesApplied",
+            createdCount,
+            editedCount,
+            skippedCount,
+            failedCount
+        });
     }
 }
+
 
 /** Longest length L such that suffix of A (len L) == prefix of B (len L). */
 function commonSuffixPrefixLen(a: string, b: string): number {
@@ -1883,4 +1935,19 @@ async function claimRefreshToken(claimUrl: string, idToken: string, state: strin
     }
     const json = JSON.parse(text);
     return json?.refreshToken || null;
+}
+
+async function safeWriteFile(fileUri: vscode.Uri, content: string) {
+    const dirUri = vscode.Uri.file(path.dirname(fileUri.fsPath));
+
+    try {
+        // Try to create directory recursively — won't throw if it already exists
+        await vscode.workspace.fs.createDirectory(dirUri);
+
+        // Write the file contents
+        await vscode.workspace.fs.writeFile(fileUri, Buffer.from(content, "utf8"));
+    } catch (err: any) {
+        vscode.window.showErrorMessage(`Failed to write file ${fileUri.fsPath}: ${err.message}`);
+        console.error("safeWriteFile error:", err);
+    }
 }
